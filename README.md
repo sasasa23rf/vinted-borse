@@ -61,7 +61,9 @@ Il repository include `Dockerfile` e `render.yaml`. Pubblica il progetto su un r
 
 Nel pannello Render aggiungi le variabili segrete `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` in **Environment**. `VINTED_POLL_SECONDS` e gia impostato a 60 nel blueprint e puo essere modificato li. Non caricare il file `.env` nel repository. Avvia una sola istanza del worker: ogni processo ha la propria RAM e istanze multiple duplicherebbero polling e notifiche Telegram.
 
-Gli annunci visti e il prezzo massimo sono tenuti solo nella RAM del processo. Al riavvio/deploy Render ripartono vuoti, il monitor reinvia al massimo le 5 inserzioni iniziali e il prezzo torna a 10 EUR. Le immagini sono inviate a Telegram tramite il loro URL remoto, senza scaricarle sul disco del container.
+Il log `No open ports detected` e normale solo per un **Background Worker**, che non deve esporre porte HTTP. Se Render imposta `WEB_CONCURRENCY` e continua a cercare porte, il servizio attuale e probabilmente un **Web Service**: crea il servizio dal Blueprint `render.yaml` oppure crea un nuovo Background Worker Docker. Non avviare il monitor come web service.
+
+Per contenere la RAM, Chromium non scarica immagini, font e media; estrae l'URL dell'immagine e lo passa a Telegram. Ogni pagina prodotto viene chiusa dopo l'invio. Il monitor mantiene al massimo 5.000 ID visti in RAM. Al riavvio/deploy Render gli ID e il prezzo massimo ripartono vuoti/default: il monitor reinvia al massimo le 5 inserzioni iniziali e il prezzo torna a 10 EUR. Nessuna foto viene salvata sul disco del container.
 
 I file `annunci_visti.json`, `monitor_config.json` e la cartella `borse_trovate` eventualmente rimasti dal test locale non vengono piu usati; non sono inclusi nell'immagine Docker.
 
