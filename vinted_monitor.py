@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+from collections import OrderedDict
+from collections.abc import Collection
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -22,6 +24,7 @@ CATALOG_URL_TEMPLATE = (
 POLL_SECONDS = max(20, int(os.getenv("VINTED_POLL_SECONDS", "60")))
 INITIAL_BATCH_LIMIT = 5
 PRICE_CHANGE_BATCH_LIMIT = 10
+MAX_SEEN_ITEMS = 5000
 DEFAULT_MAX_PRICE = "10"
 HEADLESS = os.getenv("VINTED_HEADLESS", "true").lower() not in {"0", "false", "no"}
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -72,6 +75,20 @@ def canonical_item_url(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
+def remember_item(seen_items: OrderedDict[str, None], item_id: str) -> None:
+    seen_items[item_id] = None
+    seen_items.move_to_end(item_id)
+    if len(seen_items) > MAX_SEEN_ITEMS:
+        seen_items.popitem(last=False)
+
+
+async def trim_browser_resource(route) -> None:
+    if route.request.resource_type in {"image", "font", "media"}:
+        await route.abort()
+    else:
+        await route.continue_()
+
+
 async def listing_item_urls(page) -> list[str]:
     await page.locator('a[href*="/items/"]').first.wait_for(timeout=45_000)
     links = await page.locator('a[href*="/items/"]').evaluate_all(
@@ -89,7 +106,7 @@ async def listing_item_urls(page) -> list[str]:
 
 def select_new_item_urls(
     item_urls: list[str],
-    seen_items: dict[str, dict[str, str]],
+    seen_items: Collection[str],
     limit: int | None = None,
 ) -> tuple[list[str], str | None]:
     selected_urls: list[str] = []
@@ -122,7 +139,9 @@ async def read_item(page, item_url: str) -> dict[str, str]:
 
     image_locator = page.locator("main figure img").first
     await image_locator.wait_for(timeout=20_000)
-    image_url = await image_locator.evaluate("image => image.currentSrc || image.src")
+    image_url = await image_locator.evaluate(
+        "image => image.currentSrc || image.getAttribute('src') || image.getAttribute('data-src')"
+    )
     if not image_url:
         raise RuntimeError("La scheda non contiene un URL immagine utilizzabile")
 
@@ -334,14 +353,31 @@ async def monitor() -> None:
             "Configura TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nel file .env prima dell'avvio"
         )
 
-    seen_items: dict[str, dict[str, str]] = {}
+    seen_items: OrderedDict[str, None] = OrderedDict()
     price_state = {"value": DEFAULT_MAX_PRICE}
     initial_batch = not seen_items
     first_cycle = True
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=HEADLESS)
-        page = await browser.new_page(locale="it-IT")
+        browser = await playwright.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-gpu",
+                "--no-first-run",
+            ],
+        )
+        context = await browser.new_context(
+            locale="it-IT",
+            viewport={"width": 800, "height": 600},
+            device_scale_factor=1,
+        )
+        await context.route("**/*", trim_browser_resource)
+        page = await context.new_page()
         page.set_default_timeout(30_000)
 
         try:
@@ -391,26 +427,24 @@ async def monitor() -> None:
                                 if item_id is None:
                                     continue
 
-                                item = await read_item(page, item_url)
-                                await send_telegram_item(telegram_client, item)
-                                seen_items[item_id] = {
-                                    "title": item["title"],
-                                    "url": item["item_url"],
-                                }
+                                detail_page = await context.new_page()
+                                try:
+                                    detail_page.set_default_timeout(30_000)
+                                    item = await read_item(detail_page, item_url)
+                                    await send_telegram_item(telegram_client, item)
+                                finally:
+                                    await detail_page.close()
+                                remember_item(seen_items, item_id)
                                 logger.info(
                                     "Trovata e inviata su Telegram: %s (%s)",
                                     item["title"],
                                     item["price"],
                                 )
 
-                                await page.go_back(
-                                    wait_until="domcontentloaded", timeout=60_000
-                                )
-
                             if existing_item_id:
                                 logger.info(
-                                    "Raggiunta inserzione gia salvata: %s",
-                                    seen_items[existing_item_id]["title"],
+                                    "Raggiunta inserzione gia vista: ID %s",
+                                    existing_item_id,
                                 )
                             elif initial_batch and len(urls_to_process) >= INITIAL_BATCH_LIMIT:
                                 logger.info(
@@ -452,6 +486,7 @@ async def monitor() -> None:
                     except asyncio.CancelledError:
                         pass
         finally:
+            await context.close()
             await browser.close()
 
 
