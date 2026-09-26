@@ -19,12 +19,13 @@ Invoke-RestMethod "https://api.telegram.org/bot$token/getUpdates" | ConvertTo-Js
 
 Nell'output cerca `message` e poi `chat` → `id`. Se `result` e vuoto, torna nella chat col tuo bot e invia `/start`, quindi ripeti il comando.
 
+Esegui `getUpdates` solo per trovare il chat ID prima di avviare il monitor. Non eseguire contemporaneamente questo comando manuale e il bot, perche Telegram consente un solo polling `getUpdates` per token.
+
 8. Inserisci quell'ID dopo `TELEGRAM_CHAT_ID=` nel `.env` e salva il file. Il file `.env` e escluso da Git.
 9. Installa le dipendenze e avvia il monitor:
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 python vinted_monitor.py
 ```
 
@@ -42,7 +43,6 @@ Apri PowerShell nella cartella del progetto ed esegui:
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 python vinted_monitor.py
 ```
 
@@ -63,7 +63,9 @@ Nel pannello Render aggiungi le variabili segrete `TELEGRAM_BOT_TOKEN` e `TELEGR
 
 Il log `No open ports detected` e normale solo per un **Background Worker**, che non deve esporre porte HTTP. Se Render imposta `WEB_CONCURRENCY` e continua a cercare porte, il servizio attuale e probabilmente un **Web Service**: crea il servizio dal Blueprint `render.yaml` oppure crea un nuovo Background Worker Docker. Non avviare il monitor come web service.
 
-Per contenere la RAM, Chromium non scarica immagini, font e media; estrae l'URL dell'immagine e lo passa a Telegram. Ogni pagina prodotto viene chiusa dopo l'invio. Il monitor mantiene al massimo 5.000 ID visti in RAM. Al riavvio/deploy Render gli ID e il prezzo massimo ripartono vuoti/default: il monitor reinvia al massimo le 5 inserzioni iniziali e il prezzo torna a 10 EUR. Nessuna foto viene salvata sul disco del container.
+Il monitor effettua richieste HTTP alle pagine pubbliche di Vinted e legge i dati prodotto dal JSON-LD: non installa ne avvia Chromium. Se nei log compare `Telegram getUpdates HTTP 409`, un'altra istanza sta interrogando lo stesso bot: arresta l'esecuzione locale e mantieni una sola istanza Render attiva.
+
+Il monitor mantiene al massimo 5.000 ID visti in RAM e passa a Telegram l'URL remoto dell'immagine senza scaricarla. Al riavvio/deploy Render gli ID e il prezzo massimo ripartono vuoti/default: il monitor reinvia al massimo le 5 inserzioni iniziali e il prezzo torna a 10 EUR. Nessuna foto viene salvata sul disco del container.
 
 I file `annunci_visti.json`, `monitor_config.json` e la cartella `borse_trovate` eventualmente rimasti dal test locale non vengono piu usati; non sono inclusi nell'immagine Docker.
 
