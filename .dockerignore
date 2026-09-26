@@ -1,0 +1,8 @@
+.env
+.env.*
+.venv
+__pycache__
+*.py[cod]
+annunci_visti.json
+borse_trovate
+monitor_config.json
