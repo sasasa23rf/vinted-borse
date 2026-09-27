@@ -13,6 +13,8 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlu
 
 import httpx
 from dotenv import load_dotenv
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -476,7 +478,20 @@ async def monitor() -> None:
                 pass
 
 
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Il bot e' online!")
+
+def keep_alive():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
 if __name__ == "__main__":
+    keep_alive()
     try:
         asyncio.run(monitor())
     except KeyboardInterrupt:
