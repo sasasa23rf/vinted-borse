@@ -28,7 +28,7 @@ VINTED_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
 }
-POLL_SECONDS = max(20, int(os.getenv("VINTED_POLL_SECONDS", "60")))
+POLL_SECONDS = max(5, int(os.getenv("VINTED_POLL_SECONDS", "5")))
 INITIAL_BATCH_LIMIT = 5
 PRICE_CHANGE_BATCH_LIMIT = 10
 MAX_SEEN_ITEMS = 5000
