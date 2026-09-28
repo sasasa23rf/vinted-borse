@@ -57,10 +57,30 @@ def normalize_price(value: str) -> str | None:
     return format(price.normalize(), "f")
 
 
+PRICE_STATE_FILE = ROOT_DIR / "price_state.json"
+
+def load_price_state() -> dict[str, str]:
+    if PRICE_STATE_FILE.exists():
+        try:
+            with open(PRICE_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error("Errore caricamento price_state: %s", e)
+    return {"value": DEFAULT_MAX_PRICE}
+
+def save_price_state(state: dict[str, str]) -> None:
+    try:
+        with open(PRICE_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.error("Errore salvataggio price_state: %s", e)
+
+
 def set_max_price(price_state: dict[str, str], price: str) -> None:
     if price_state["value"] != price:
         price_state["value"] = price
         price_state["batch_price"] = price
+        save_price_state(price_state)
 
 
 def catalog_url(max_price: str) -> str:
@@ -409,7 +429,7 @@ async def monitor() -> None:
         )
 
     seen_items: OrderedDict[str, None] = load_seen_items()
-    price_state = {"value": DEFAULT_MAX_PRICE}
+    price_state = load_price_state()
     initial_batch = not seen_items
     async with (
         httpx.AsyncClient(
@@ -490,6 +510,7 @@ async def monitor() -> None:
                         and price_state.get("batch_price") == cycle_price
                     ):
                         price_state.pop("batch_price", None)
+                        save_price_state(price_state)
 
                 logger.info(
                     "Prossimo aggiornamento del catalogo tra %d secondi", POLL_SECONDS
