@@ -247,6 +247,7 @@ async def process_telegram_update(
     update: dict,
     price_state: dict[str, str],
     awaiting_custom_price: set[str],
+    bot_state: dict[str, bool],
 ) -> None:
     callback = update.get("callback_query")
     if callback:
@@ -318,13 +319,19 @@ async def process_telegram_update(
             price_menu(),
         )
     elif command == "/start":
+        bot_state["active"] = True
         await telegram_send_text(
-            client, chat_id, "Monitor Vinted attivo. Usa /prezzo per cambiare il prezzo massimo."
+            client, chat_id, "Monitor Vinted avviato! Usa /prezzo per cambiare il prezzo massimo o /stop per fermarlo."
+        )
+    elif command == "/stop":
+        bot_state["active"] = False
+        await telegram_send_text(
+            client, chat_id, "Monitor Vinted fermato. Usa /start per riavviarlo."
         )
 
 
 async def telegram_command_listener(
-    client: httpx.AsyncClient, price_state: dict[str, str]
+    client: httpx.AsyncClient, price_state: dict[str, str], bot_state: dict[str, bool]
 ) -> None:
     offset: int | None = None
     awaiting_custom_price: set[str] = set()
@@ -345,7 +352,7 @@ async def telegram_command_listener(
             for update in result.get("result", []):
                 offset = int(update["update_id"]) + 1
                 await process_telegram_update(
-                    client, update, price_state, awaiting_custom_price
+                    client, update, price_state, awaiting_custom_price, bot_state
                 )
         except asyncio.CancelledError:
             raise
@@ -443,6 +450,7 @@ async def monitor() -> None:
 
     seen_items: OrderedDict[str, None] = load_seen_items()
     price_state = load_price_state()
+    bot_state = {"active": True}
     initial_batch = not seen_items
     pool_limits = httpx.Limits(
         max_connections=5,
@@ -458,10 +466,14 @@ async def monitor() -> None:
         httpx.AsyncClient(timeout=30, limits=pool_limits) as telegram_client,
     ):
         telegram_task = asyncio.create_task(
-            telegram_command_listener(telegram_client, price_state)
+            telegram_command_listener(telegram_client, price_state, bot_state)
         )
         try:
             while True:
+                if not bot_state["active"]:
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
+
                 cycle_price = price_state["value"]
                 cycle_batch_price = price_state.get("batch_price")
                 cycle_succeeded = False
