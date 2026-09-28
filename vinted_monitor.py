@@ -15,7 +15,7 @@ import httpx
 from dotenv import load_dotenv
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -530,10 +530,15 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b"Il bot e' online!")
+        
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
 
 def keep_alive():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), DummyHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 if __name__ == "__main__":
