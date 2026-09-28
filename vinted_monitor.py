@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 from collections import OrderedDict
 from collections.abc import Collection
@@ -533,10 +534,11 @@ async def monitor() -> None:
                         save_price_state(price_state)
 
                 gc.collect()
+                wait = random.randint(5, 20)
                 logger.info(
-                    "Prossimo aggiornamento del catalogo tra %d secondi", POLL_SECONDS
+                    "Prossimo aggiornamento del catalogo tra %d secondi", wait
                 )
-                await asyncio.sleep(POLL_SECONDS)
+                await asyncio.sleep(wait)
         finally:
             telegram_task.cancel()
             try:
