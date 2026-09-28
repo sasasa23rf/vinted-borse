@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import html
 import json
 import logging
@@ -29,10 +30,10 @@ VINTED_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
 }
-POLL_SECONDS = max(5, int(os.getenv("VINTED_POLL_SECONDS", "5")))
+POLL_SECONDS = max(5, int(os.getenv("VINTED_POLL_SECONDS", "15")))
 INITIAL_BATCH_LIMIT = 5
 PRICE_CHANGE_BATCH_LIMIT = 10
-MAX_SEEN_ITEMS = 5000
+MAX_SEEN_ITEMS = 500
 DEFAULT_MAX_PRICE = os.getenv("DEFAULT_MAX_PRICE", "10").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -124,10 +125,15 @@ class CatalogLinkParser(HTMLParser):
 
 
 async def listing_item_urls(client: httpx.AsyncClient, max_price: str) -> list[str]:
-    response = await client.get(catalog_url(max_price), timeout=45)
-    response.raise_for_status()
+    response = await client.get(catalog_url(max_price), timeout=30)
+    try:
+        response.raise_for_status()
+        page_text = response.text
+    finally:
+        await response.aclose()
     parser = CatalogLinkParser()
-    parser.feed(response.text)
+    parser.feed(page_text)
+    del page_text
     unique_urls: list[str] = []
     found_ids: set[str] = set()
     for url in parser.urls:
@@ -157,13 +163,19 @@ def select_new_item_urls(
 
 
 async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
-    response = await client.get(item_url, timeout=45)
-    response.raise_for_status()
+    response = await client.get(item_url, timeout=30)
+    try:
+        response.raise_for_status()
+        page_text = response.text
+        item_final_url = str(response.url)
+    finally:
+        await response.aclose()
     match = re.search(
         r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-        response.text,
+        page_text,
         re.DOTALL | re.IGNORECASE,
     )
+    del page_text
     if not match:
         raise RuntimeError("Dati prodotto JSON-LD assenti nella pagina Vinted")
     product = json.loads(match.group(1))
@@ -182,7 +194,7 @@ async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
         "price": price,
         "description": html.unescape(str(product.get("description", "Descrizione non presente"))).strip(),
         "image_url": str(image_url),
-        "item_url": canonical_item_url(str(offers.get("url") or response.url)),
+        "item_url": canonical_item_url(str(offers.get("url") or item_final_url)),
     }
 
 
@@ -431,13 +443,18 @@ async def monitor() -> None:
     seen_items: OrderedDict[str, None] = load_seen_items()
     price_state = load_price_state()
     initial_batch = not seen_items
+    pool_limits = httpx.Limits(
+        max_connections=5,
+        max_keepalive_connections=2,
+    )
     async with (
         httpx.AsyncClient(
-            timeout=45,
+            timeout=30,
             headers=VINTED_HEADERS,
             follow_redirects=True,
+            limits=pool_limits,
         ) as vinted_client,
-        httpx.AsyncClient(timeout=30) as telegram_client,
+        httpx.AsyncClient(timeout=30, limits=pool_limits) as telegram_client,
     ):
         telegram_task = asyncio.create_task(
             telegram_command_listener(telegram_client, price_state)
@@ -481,6 +498,9 @@ async def monitor() -> None:
                             item["title"],
                             item["price"],
                         )
+                        del item  # libera subito titolo, descrizione, immagine ecc.
+
+                    del item_urls, urls_to_process  # libera le liste di URL
 
                     if existing_item_id:
                         logger.info(
@@ -512,6 +532,7 @@ async def monitor() -> None:
                         price_state.pop("batch_price", None)
                         save_price_state(price_state)
 
+                gc.collect()
                 logger.info(
                     "Prossimo aggiornamento del catalogo tra %d secondi", POLL_SECONDS
                 )
@@ -524,26 +545,43 @@ async def monitor() -> None:
                 pass
 
 
-class DummyHandler(BaseHTTPRequestHandler):
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b"Il bot e' online!")
-        
+
     def do_HEAD(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
 
-def keep_alive():
+    def log_message(self, format, *args):
+        # Silenzio i log del web server per non inquinare l'output
+        pass
+
+
+def start_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = ThreadingHTTPServer(('0.0.0.0', port), DummyHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
+    # daemon=False: il web server resta vivo anche se il monitor crasha
+    thread = threading.Thread(target=server.serve_forever, daemon=False)
+    thread.start()
+    logger.info("Health server avviato sulla porta %d", port)
+
 
 if __name__ == "__main__":
-    keep_alive()
-    try:
-        asyncio.run(monitor())
-    except KeyboardInterrupt:
-        logger.info("Monitor interrotto dall'utente")
+    start_health_server()
+    while True:
+        try:
+            logger.info("Avvio del monitor Vinted...")
+            asyncio.run(monitor())
+        except KeyboardInterrupt:
+            logger.info("Monitor interrotto dall'utente")
+            break
+        except Exception:
+            logger.exception(
+                "Il monitor e' crashato. Riavvio automatico tra 10 secondi..."
+            )
+            time.sleep(10)
