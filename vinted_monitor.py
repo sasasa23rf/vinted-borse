@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlu
 import httpx
 from dotenv import load_dotenv
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -66,6 +67,7 @@ def catalog_url(max_price: str) -> str:
     parts = urlsplit(CATALOG_URL_TEMPLATE.format(price="0"))
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["price_to"] = max_price
+    query["time"] = str(int(time.time()))
     return urlunsplit(
         (parts.scheme, parts.netloc, parts.path, urlencode(query, safe="[]"), "")
     )
@@ -378,13 +380,35 @@ async def send_telegram_item(
             await telegram_api_call(client, "sendMessage", data)
 
 
+SEEN_ITEMS_FILE = ROOT_DIR / "seen_items.json"
+
+def load_seen_items() -> OrderedDict[str, None]:
+    seen: OrderedDict[str, None] = OrderedDict()
+    if SEEN_ITEMS_FILE.exists():
+        try:
+            with open(SEEN_ITEMS_FILE, "r") as f:
+                data = json.load(f)
+                for item_id in data:
+                    seen[item_id] = None
+        except Exception as e:
+            logger.error("Errore caricamento cache: %s", e)
+    return seen
+
+def save_seen_items(seen: OrderedDict[str, None]) -> None:
+    try:
+        with open(SEEN_ITEMS_FILE, "w") as f:
+            json.dump(list(seen.keys()), f)
+    except Exception as e:
+        logger.error("Errore salvataggio cache: %s", e)
+
+
 async def monitor() -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError(
             "Configura TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nell'ambiente prima dell'avvio"
         )
 
-    seen_items: OrderedDict[str, None] = OrderedDict()
+    seen_items: OrderedDict[str, None] = load_seen_items()
     price_state = {"value": DEFAULT_MAX_PRICE}
     initial_batch = not seen_items
     async with (
@@ -431,6 +455,7 @@ async def monitor() -> None:
                         item = await read_item(vinted_client, item_url)
                         await send_telegram_item(telegram_client, item)
                         remember_item(seen_items, item_id)
+                        save_seen_items(seen_items)
                         logger.info(
                             "Trovata e inviata su Telegram: %s (%s)",
                             item["title"],
@@ -455,8 +480,8 @@ async def monitor() -> None:
                         )
                     cycle_succeeded = True
 
-                except Exception:
-                    logger.exception("Errore durante il controllo; riprovo al prossimo ciclo")
+                except Exception as e:
+                    logger.exception("Errore durante il controllo (%s); riprovo al prossimo ciclo", type(e).__name__)
                 finally:
                     initial_batch = False
                     if (
