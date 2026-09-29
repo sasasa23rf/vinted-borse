@@ -308,7 +308,7 @@ async def process_telegram_update(
             brand_key = callback_data.removeprefix("brand:")
             if brand_key in BRANDS:
                 bot_state["brand"] = brand_key
-                bot_state["batch_price"] = price_state["value"] # forza nuovo batch limit
+                bot_state["force_batch_limit"] = 6
                 await telegram_send_text(
                     client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}."
                 )
@@ -535,7 +535,9 @@ async def monitor() -> None:
                         len(item_urls),
                         cycle_price,
                     )
-                    if initial_batch:
+                    if bot_state.get("force_batch_limit"):
+                        limit = bot_state.pop("force_batch_limit")
+                    elif initial_batch:
                         limit = INITIAL_BATCH_LIMIT
                     elif cycle_batch_price == cycle_price:
                         limit = PRICE_CHANGE_BATCH_LIMIT
