@@ -1,7 +1,0 @@
-.env
-.venv/
-__pycache__/
-*.py[cod]
-monitor_config.json
-annunci_visti.json
-borse_trovate/
