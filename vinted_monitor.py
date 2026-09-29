@@ -52,9 +52,22 @@ BRANDS = {
     }
 }
 VINTED_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
+MAX_CACHED_ITEM_IMAGES = 200
 POLL_SECONDS = max(5, int(os.getenv("VINTED_POLL_SECONDS", "15")))
 INITIAL_BATCH_LIMIT = 5
 PRICE_CHANGE_BATCH_LIMIT = 10
@@ -267,13 +280,51 @@ async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
     }
 
 
-async def fetch_item_image_urls(client: httpx.AsyncClient, item_url: str) -> list[str]:
-    response = await client.get(item_url, timeout=30)
+def remember_item_images(
+    cache: OrderedDict[str, list[str]], item_id: str, image_urls: list[str]
+) -> None:
+    cache[item_id] = list(image_urls)
+    cache.move_to_end(item_id)
+    while len(cache) > MAX_CACHED_ITEM_IMAGES:
+        cache.popitem(last=False)
+
+
+async def fetch_item_image_urls(
+    client: httpx.AsyncClient,
+    item_url: str,
+    *,
+    warm_catalog_url: str | None = None,
+) -> list[str]:
+    async def _load_page() -> str:
+        response = await client.get(
+            item_url,
+            timeout=30,
+            headers={
+                **VINTED_HEADERS,
+                "Referer": "https://www.vinted.it/",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        try:
+            response.raise_for_status()
+            return response.text
+        finally:
+            await response.aclose()
+
     try:
-        response.raise_for_status()
-        page_text = response.text
-    finally:
-        await response.aclose()
+        page_text = await _load_page()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != 403 or not warm_catalog_url:
+            raise
+        # Senza cookie di sessione Vinted spesso risponde 403: riscaldiamo via catalogo.
+        logger.info("Item page 403: riscaldo sessione Vinted dal catalogo")
+        warm = await client.get(warm_catalog_url, timeout=30)
+        try:
+            warm.raise_for_status()
+        finally:
+            await warm.aclose()
+        page_text = await _load_page()
+
     product_images: list[str] = []
     match = re.search(
         r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
@@ -293,7 +344,16 @@ async def fetch_item_image_urls(client: httpx.AsyncClient, item_url: str) -> lis
 
 
 async def download_image_bytes(client: httpx.AsyncClient, image_url: str) -> bytes:
-    response = await client.get(image_url, timeout=60)
+    response = await client.get(
+        image_url,
+        timeout=60,
+        headers={
+            "User-Agent": VINTED_HEADERS["User-Agent"],
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": VINTED_HEADERS["Accept-Language"],
+            "Referer": "https://www.vinted.it/",
+        },
+    )
     try:
         response.raise_for_status()
         return response.content
@@ -601,21 +661,30 @@ async def generate_images_job(
             "Sto scaricando le foto dell'inserzione e rimuovendo lo sfondo…",
         )
 
-        pool_limits = httpx.Limits(max_connections=5, max_keepalive_connections=2)
-        async with httpx.AsyncClient(
-            timeout=60,
-            headers=VINTED_HEADERS,
-            follow_redirects=True,
-            limits=pool_limits,
-        ) as vinted_client:
-            image_urls = await fetch_item_image_urls(vinted_client, item_url)
-            logger.info(
-                "Generazione immagini: trovate %d foto per item %s",
-                len(image_urls),
-                item_id,
+        image_cache: OrderedDict[str, list[str]] = bot_state.setdefault(
+            "item_image_urls", OrderedDict()
+        )
+        image_urls = list(image_cache.get(item_id, []))
+        vinted_client = bot_state.get("vinted_client")
+        if vinted_client is None:
+            raise RuntimeError("Client Vinted non disponibile")
+
+        if not image_urls:
+            brand_key = str(bot_state.get("brand", "michael_kors"))
+            price = str(bot_state.get("price_value") or DEFAULT_MAX_PRICE)
+            warm_url = catalog_url(price, brand_key)
+            image_urls = await fetch_item_image_urls(
+                vinted_client, item_url, warm_catalog_url=warm_url
             )
-            for image_url in image_urls:
-                stored_images.append(await download_image_bytes(vinted_client, image_url))
+            remember_item_images(image_cache, item_id, image_urls)
+
+        logger.info(
+            "Generazione immagini: %d foto per item %s",
+            len(image_urls),
+            item_id,
+        )
+        for image_url in image_urls:
+            stored_images.append(await download_image_bytes(vinted_client, image_url))
 
         total = len(stored_images)
         if total == 0:
@@ -711,7 +780,12 @@ async def monitor() -> None:
 
     seen_items: OrderedDict[str, None] = load_seen_items()
     price_state = load_price_state()
-    bot_state = {"active": True, "busy_images": False}
+    bot_state = {
+        "active": True,
+        "busy_images": False,
+        "item_image_urls": OrderedDict(),
+        "price_value": price_state["value"],
+    }
     initial_batch = not seen_items
     pool_limits = httpx.Limits(
         max_connections=5,
@@ -726,6 +800,7 @@ async def monitor() -> None:
         ) as vinted_client,
         httpx.AsyncClient(timeout=30, limits=pool_limits) as telegram_client,
     ):
+        bot_state["vinted_client"] = vinted_client
         telegram_task = asyncio.create_task(
             telegram_command_listener(telegram_client, price_state, bot_state)
         )
@@ -739,6 +814,7 @@ async def monitor() -> None:
                     continue
 
                 cycle_price = price_state["value"]
+                bot_state["price_value"] = cycle_price
                 cycle_batch_price = price_state.get("batch_price")
                 cycle_succeeded = False
                 try:
@@ -770,6 +846,11 @@ async def monitor() -> None:
                             continue
 
                         item = await read_item(vinted_client, item_url)
+                        remember_item_images(
+                            bot_state["item_image_urls"],
+                            item_id,
+                            list(item.get("image_urls") or [item["image_url"]]),
+                        )
                         await send_telegram_item(telegram_client, item)
                         remember_item(seen_items, item_id)
                         save_seen_items(seen_items)
