@@ -96,15 +96,20 @@ def _run_pixelcut(foto_path: str, save_path: str) -> None:
             # Cerchiamo il pulsante per il download gratuito / anteprima
             print("Selezione risoluzione gratuita...")
 
-            # Cerchiamo vari testi possibili nel popup
-            free_btn = page.locator("text=/anteprima/i").first
+            # Preferiamo elementi cliccabili (button/a/label), non nodi di solo testo:
+            # in headless su Render "text=/gratuito|free/" viene trovato ma poi sparisce al click.
+            free_btn = page.locator("button, a, label, [role='button']").filter(
+                has_text=re.compile(r"anteprima", re.IGNORECASE)
+            ).first
 
             try:
                 free_btn.wait_for(state="visible", timeout=5000)
                 print("Pulsante con 'anteprima' trovato!")
             except Exception:
                 print("Testo 'anteprima' non trovato. Cerco la parola 'gratuito' o 'free'...")
-                free_btn = page.locator("text=/gratuito|free/i").first
+                free_btn = page.locator("button, a, label, [role='button']").filter(
+                    has_text=re.compile(r"gratuito|free", re.IGNORECASE)
+                ).first
                 try:
                     free_btn.wait_for(state="visible", timeout=5000)
                     print("Pulsante gratuito trovato!")
@@ -112,21 +117,48 @@ def _run_pixelcut(foto_path: str, save_path: str) -> None:
                     print(
                         "Nessun testo specifico trovato. Cerco il pulsante 'Scarica' nel popup..."
                     )
-                    # Cerchiamo un pulsante Scarica che sia visibile nel popup
                     free_btn = (
                         page.locator("button")
                         .filter(has_text=re.compile(r"(Scarica|Download)", re.IGNORECASE))
                         .locator("visible=true")
                         .last
                     )
+                    free_btn.wait_for(state="visible", timeout=5000)
 
             print("Avvio scaricamento...")
-            with page.expect_download(timeout=60000) as download_info:
-                free_btn.click(force=True, timeout=60000)
-            download = download_info.value
+            # Handle catturato subito: evita che Playwright ri-cerchi il locator per 60s
+            handle = free_btn.element_handle(timeout=5000)
+            if handle is None:
+                raise RuntimeError("Pulsante download gratuito non disponibile nel DOM")
 
-            download.save_as(save_path)
-            print(f"Successo! Immagine salvata in: {save_path}")
+            try:
+                with page.expect_download(timeout=60000) as download_info:
+                    handle.evaluate(
+                        """el => {
+                            const target = el.closest('button, a, label, [role="button"]') || el;
+                            target.click();
+                        }"""
+                    )
+                download = download_info.value
+                download.save_as(save_path)
+                print(f"Successo! Immagine salvata in: {save_path}")
+            except Exception as download_error:
+                print(
+                    f"Download via pulsante fallito ({type(download_error).__name__}). "
+                    "Provo a catturare l'anteprima elaborata dalla pagina..."
+                )
+                # Fallback: salva l'immagine risultato gia visibile dopo la rimozione sfondo
+                preview = page.locator("canvas").last
+                try:
+                    preview.wait_for(state="visible", timeout=5000)
+                    preview.screenshot(path=save_path, type="png")
+                except Exception:
+                    preview = page.locator("img").last
+                    preview.wait_for(state="visible", timeout=10000)
+                    preview.screenshot(path=save_path, type="png")
+                if not os.path.isfile(save_path) or os.path.getsize(save_path) == 0:
+                    raise download_error
+                print(f"Successo via anteprima pagina! Immagine salvata in: {save_path}")
         finally:
             # Chiudi il browser PRIMA di uscire da sync_playwright:
             # evita RuntimeError "event loop is already running" in cleanup.
