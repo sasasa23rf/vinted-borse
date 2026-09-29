@@ -23,10 +23,32 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT_DIR = Path(__file__).resolve().parent
 load_dotenv(ROOT_DIR / ".env")
 
-CATALOG_URL_TEMPLATE = (
-    "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=6005&page=1"
-    "&time=1790433089&order=newest_first&price_to={price}&currency=EUR"
-)
+BRANDS = {
+    "michael_kors": {
+        "name": "Michael Kors",
+        "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=6005&page=1&order=newest_first&price_to={price}&currency=EUR"
+    },
+    "guess": {
+        "name": "Guess",
+        "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=20&page=1&order=newest_first&price_to={price}&currency=EUR"
+    },
+    "liu_jo": {
+        "name": "Liu Jo",
+        "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=2165&page=1&order=newest_first&price_to={price}&currency=EUR"
+    },
+    "armani": {
+        "name": "Armani",
+        "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=5930015&page=1&order=newest_first&price_to={price}&currency=EUR"
+    },
+    "calvin_klein": {
+        "name": "Calvin Klein",
+        "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=255&page=1&order=newest_first&price_to={price}&currency=EUR"
+    },
+    "trussardi": {
+        "name": "Trussardi",
+        "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=8729&page=1&order=newest_first&price_to={price}&currency=EUR"
+    }
+}
 VINTED_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
@@ -85,8 +107,9 @@ def set_max_price(price_state: dict[str, str], price: str) -> None:
         save_price_state(price_state)
 
 
-def catalog_url(max_price: str) -> str:
-    parts = urlsplit(CATALOG_URL_TEMPLATE.format(price="0"))
+def catalog_url(max_price: str, brand_key: str = "michael_kors") -> str:
+    url_template = BRANDS.get(brand_key, BRANDS["michael_kors"])["url"]
+    parts = urlsplit(url_template.format(price="0"))
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["price_to"] = max_price
     query["time"] = str(int(time.time()))
@@ -125,8 +148,8 @@ class CatalogLinkParser(HTMLParser):
             self.urls.append(urljoin("https://www.vinted.it", html.unescape(href)))
 
 
-async def listing_item_urls(client: httpx.AsyncClient, max_price: str) -> list[str]:
-    response = await client.get(catalog_url(max_price), timeout=30)
+async def listing_item_urls(client: httpx.AsyncClient, max_price: str, brand_key: str = "michael_kors") -> list[str]:
+    response = await client.get(catalog_url(max_price, brand_key), timeout=30)
     try:
         response.raise_for_status()
         page_text = response.text
@@ -241,13 +264,21 @@ def price_menu() -> dict:
     rows.append([{"text": "Altro importo", "callback_data": "max:custom"}])
     return {"inline_keyboard": rows}
 
+def brand_menu() -> dict:
+    buttons = [
+        {"text": brand["name"], "callback_data": f"brand:{key}"}
+        for key, brand in BRANDS.items()
+    ]
+    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    return {"inline_keyboard": rows}
+
 
 async def process_telegram_update(
     client: httpx.AsyncClient,
     update: dict,
     price_state: dict[str, str],
     awaiting_custom_price: set[str],
-    bot_state: dict[str, bool],
+    bot_state: dict,
 ) -> None:
     callback = update.get("callback_query")
     if callback:
@@ -272,6 +303,14 @@ async def process_telegram_update(
                 set_max_price(price_state, price)
                 await telegram_send_text(
                     client, chat_id, f"Prezzo massimo impostato a {price} €."
+                )
+        elif callback_data.startswith("brand:"):
+            brand_key = callback_data.removeprefix("brand:")
+            if brand_key in BRANDS:
+                bot_state["brand"] = brand_key
+                bot_state["batch_price"] = price_state["value"] # forza nuovo batch limit
+                await telegram_send_text(
+                    client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}."
                 )
         return
 
@@ -328,10 +367,18 @@ async def process_telegram_update(
         await telegram_send_text(
             client, chat_id, "Monitor Vinted fermato. Usa /start per riavviarlo."
         )
+    elif command == "/brand":
+        current_brand = str(bot_state.get('brand', 'michael_kors'))
+        await telegram_send_text(
+            client,
+            chat_id,
+            f"Brand attuale: {BRANDS[current_brand]['name']}. Scegli un brand:",
+            brand_menu(),
+        )
 
 
 async def telegram_command_listener(
-    client: httpx.AsyncClient, price_state: dict[str, str], bot_state: dict[str, bool]
+    client: httpx.AsyncClient, price_state: dict[str, str], bot_state: dict
 ) -> None:
     offset: int | None = None
     awaiting_custom_price: set[str] = set()
@@ -478,7 +525,8 @@ async def monitor() -> None:
                 cycle_batch_price = price_state.get("batch_price")
                 cycle_succeeded = False
                 try:
-                    item_urls = await listing_item_urls(vinted_client, cycle_price)
+                    current_brand = str(bot_state.get('brand', 'michael_kors'))
+                    item_urls = await listing_item_urls(vinted_client, cycle_price, current_brand)
                     if not item_urls:
                         raise RuntimeError("Nessuna inserzione trovata nel catalogo")
 
