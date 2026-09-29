@@ -696,101 +696,67 @@ async def generate_images_job(
     item_id: str,
     bot_state: dict,
 ) -> None:
+    """Rimuove lo sfondo solo dalla prima foto (quella inviata su Telegram)."""
     item_url = f"https://www.vinted.it/items/{item_id}"
-    stored_images: list[bytes | None] = []
+    image_bytes: bytes | None = None
+    processed: bytes | None = None
     try:
         await telegram_send_text(
             telegram_client,
             TELEGRAM_CHAT_ID,
             "⏸️ Ricerca inserzioni in pausa.\n"
-            "Sto scaricando le foto dell'inserzione e rimuovendo lo sfondo…",
+            "Sto elaborando la prima foto (quella del messaggio)…",
         )
 
         image_cache: OrderedDict[str, list[str]] = bot_state.setdefault(
             "item_image_urls", OrderedDict()
         )
-        image_urls = list(image_cache.get(item_id, []))
+        cached = list(image_cache.get(item_id, []))
         vinted_client = bot_state.get("vinted_client")
         if vinted_client is None:
             raise RuntimeError("Client Vinted non disponibile")
 
-        if not image_urls:
+        if cached:
+            first_image_url = cached[0]
+        else:
             brand_key = str(bot_state.get("brand", "michael_kors"))
             price = str(bot_state.get("price_value") or DEFAULT_MAX_PRICE)
             warm_url = catalog_url(price, brand_key)
-            image_urls = await fetch_item_image_urls(
+            fetched = await fetch_item_image_urls(
                 vinted_client, item_url, warm_catalog_url=warm_url
             )
-            remember_item_images(image_cache, item_id, image_urls)
+            if not fetched:
+                raise RuntimeError("Nessuna foto trovata nell'inserzione")
+            first_image_url = fetched[0]
+            remember_item_images(image_cache, item_id, [first_image_url])
 
         logger.info(
-            "Generazione immagini: %d foto per item %s",
-            len(image_urls),
+            "Generazione immagini: solo prima foto per item %s",
             item_id,
         )
-        for image_url in image_urls:
-            try:
-                stored_images.append(await download_image_bytes(vinted_client, image_url))
-            except httpx.HTTPStatusError as error:
-                status = error.response.status_code
-                if status in {403, 404}:
-                    logger.warning(
-                        "Salto foto non scaricabile (%d): %s",
-                        status,
-                        image_url[:120],
-                    )
-                    continue
-                raise
-
-        total = len(stored_images)
-        if total == 0:
-            raise RuntimeError("Nessuna foto scaricata in RAM")
+        image_bytes = await download_image_bytes(vinted_client, first_image_url)
 
         await telegram_send_text(
             telegram_client,
             TELEGRAM_CHAT_ID,
-            f"Foto caricate in memoria: {total}. Avvio rimozione sfondo…",
+            "Foto caricata in memoria. Avvio rimozione sfondo…",
         )
 
-        for index in range(len(stored_images)):
-            image_bytes = stored_images[index]
-            if image_bytes is None:
-                continue
-            stored_images[index] = None
-            try:
-                processed = await asyncio.to_thread(remove_background, image_bytes)
-            except Exception:
-                logger.exception(
-                    "Rimozione sfondo fallita per foto %d/%d (item %s)",
-                    index + 1,
-                    total,
-                    item_id,
-                )
-                del image_bytes
-                await telegram_send_text(
-                    telegram_client,
-                    TELEGRAM_CHAT_ID,
-                    f"Errore sulla foto {index + 1}/{total}: passaggio alla successiva.",
-                )
-                gc.collect()
-                continue
+        processed = await asyncio.to_thread(remove_background, image_bytes)
+        del image_bytes
+        image_bytes = None
 
-            del image_bytes
-            try:
-                await send_telegram_photo_bytes(
-                    telegram_client,
-                    processed,
-                    caption=f"Immagine {index + 1}/{total} senza sfondo",
-                    filename=f"no_bg_{item_id}_{index + 1}.png",
-                )
-            finally:
-                del processed
-                gc.collect()
+        await send_telegram_photo_bytes(
+            telegram_client,
+            processed,
+            caption="Immagine senza sfondo",
+            filename=f"no_bg_{item_id}.png",
+        )
 
         await telegram_send_text(
             telegram_client,
             TELEGRAM_CHAT_ID,
-            "✅ Generazione immagini completata.\nRiprendo la ricerca inserzioni.",
+            "✅ Generazione immagine completata.\nRiprendo la ricerca inserzioni.",
         )
     except Exception as error:
         logger.exception("Generazione immagini fallita per item %s", item_id)
@@ -801,7 +767,10 @@ async def generate_images_job(
             "Riprendo la ricerca inserzioni.",
         )
     finally:
-        stored_images.clear()
+        if image_bytes is not None:
+            del image_bytes
+        if processed is not None:
+            del processed
         bot_state["busy_images"] = False
         gc.collect()
 
@@ -906,7 +875,7 @@ async def monitor() -> None:
                         remember_item_images(
                             bot_state["item_image_urls"],
                             item_id,
-                            list(item.get("image_urls") or [item["image_url"]]),
+                            [item["image_url"]],
                         )
                         await send_telegram_item(telegram_client, item)
                         remember_item(seen_items, item_id)
