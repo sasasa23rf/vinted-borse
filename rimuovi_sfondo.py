@@ -1,9 +1,13 @@
-"""Rimozione sfondo via Pixelcut — logica identica a esempio.py.
+"""Rimozione sfondo via Pixelcut — logica di esempio.py.
 
-Differenze minime rispetto a esempio.py:
-- input/output in bytes (file temporanei, come serve al bot)
-- headless configurabile (su Render deve essere true)
-- esecuzione in processo separato per non confliggere con asyncio
+Perche falliva su Render:
+1) Il click su "gratuito/free" di Pixelcut in headless spesso non apre il download
+   (in locale esempio.py usa browser visibile e funziona).
+2) Se quel click va in timeout, Playwright in cleanup lanciava anche
+   "This event loop is already running" e mascherava l'errore vero.
+
+Qui: stessa sequenza di esempio.py, browser chiuso sempre in finally,
+e worker in subprocess reale (non ProcessPool) per isolare Playwright da asyncio.
 """
 
 from __future__ import annotations
@@ -11,8 +15,9 @@ from __future__ import annotations
 import glob
 import os
 import re
+import subprocess
+import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -35,25 +40,15 @@ def _guess_suffix(image_bytes: bytes) -> str:
     return ".jpg"
 
 
-def _remove_background_impl(image_bytes: bytes) -> bytes:
-    """Corpo = esempio.py main(), con foto in/out via file temporanei."""
-    if not image_bytes:
-        raise ValueError("Immagine vuota: impossibile rimuovere lo sfondo")
-
-    suffix = _guess_suffix(image_bytes)
-    tmp_dir = tempfile.mkdtemp(prefix="pixelcut_")
-    try:
-        foto_path = os.path.join(tmp_dir, f"foto{suffix}")
-        with open(foto_path, "wb") as handle:
-            handle.write(image_bytes)
-
-        original_ext = os.path.splitext(foto_path)[1]
-
-        with sync_playwright() as p:
+def _run_pixelcut(foto_path: str, save_path: str) -> None:
+    """Flusso identico a esempio.py main(), da file a file."""
+    browser = None
+    with sync_playwright() as p:
+        try:
             print("Avvio del browser...")
             # headless=False in esempio.py; su Render serve True
             browser = p.chromium.launch(headless=HEADLESS)
-            context = browser.new_context()
+            context = browser.new_context(accept_downloads=True)
             page = context.new_page()
 
             print("Apertura del sito web...")
@@ -127,42 +122,70 @@ def _remove_background_impl(image_bytes: bytes) -> bytes:
 
             print("Avvio scaricamento...")
             with page.expect_download(timeout=60000) as download_info:
-                free_btn.click(force=True)
+                free_btn.click(force=True, timeout=60000)
             download = download_info.value
 
-            # Salviamo il file nella stessa cartella con nome 'fotosenzasfondo'
-            save_path = os.path.join(tmp_dir, f"fotosenzasfondo{original_ext}")
             download.save_as(save_path)
-
             print(f"Successo! Immagine salvata in: {save_path}")
+        finally:
+            # Chiudi il browser PRIMA di uscire da sync_playwright:
+            # evita RuntimeError "event loop is already running" in cleanup.
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
-            browser.close()
+
+def _remove_background_impl(image_bytes: bytes) -> bytes:
+    if not image_bytes:
+        raise ValueError("Immagine vuota: impossibile rimuovere lo sfondo")
+
+    suffix = _guess_suffix(image_bytes)
+    with tempfile.TemporaryDirectory(prefix="pixelcut_") as tmp_dir:
+        foto_path = os.path.join(tmp_dir, f"foto{suffix}")
+        save_path = os.path.join(tmp_dir, f"fotosenzasfondo{suffix}")
+        with open(foto_path, "wb") as handle:
+            handle.write(image_bytes)
+
+        _run_pixelcut(foto_path, save_path)
 
         with open(save_path, "rb") as handle:
             result = handle.read()
         if not result:
             raise RuntimeError("Download Pixelcut vuoto")
         return result
-    finally:
-        for path in Path(tmp_dir).glob("*"):
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        try:
-            os.rmdir(tmp_dir)
-        except OSError:
-            pass
 
 
 def remove_background(image_bytes: bytes) -> bytes:
-    """Esegue la logica di esempio.py in un processo figlio (safe con asyncio)."""
-    import multiprocessing
+    """Lancia un subprocess Python dedicato (isolamento totale da asyncio)."""
+    suffix = _guess_suffix(image_bytes)
+    with tempfile.TemporaryDirectory(prefix="pixelcut_job_") as tmp_dir:
+        foto_path = os.path.join(tmp_dir, f"foto{suffix}")
+        save_path = os.path.join(tmp_dir, f"fotosenzasfondo{suffix}")
+        with open(foto_path, "wb") as handle:
+            handle.write(image_bytes)
 
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(_remove_background_impl, image_bytes)
-        return future.result(timeout=300)
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--worker", foto_path, save_path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env={**os.environ, "PIXELCUT_HEADLESS": os.getenv("PIXELCUT_HEADLESS", "true")},
+        )
+        if proc.stdout:
+            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+        if proc.returncode != 0:
+            if proc.stderr:
+                print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n")
+            detail = (proc.stderr or proc.stdout or "errore sconosciuto").strip()
+            raise RuntimeError(f"Rimozione sfondo fallita: {detail[-500:]}")
+
+        with open(save_path, "rb") as handle:
+            result = handle.read()
+        if not result:
+            raise RuntimeError("Download Pixelcut vuoto")
+        return result
 
 
 def find_foto():
@@ -192,4 +215,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--worker":
+        _run_pixelcut(sys.argv[2], sys.argv[3])
+    else:
+        main()
