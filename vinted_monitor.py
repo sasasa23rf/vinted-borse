@@ -301,16 +301,20 @@ async def process_telegram_update(
             price = normalize_price(callback_data.removeprefix("max:"))
             if price:
                 set_max_price(price_state, price)
-                await telegram_send_text(
-                    client, chat_id, f"Prezzo massimo impostato a {price} €."
-                )
+                msg = f"Prezzo massimo impostato a {price} €."
+                if bot_state.pop("awaiting_price_for_brand", False):
+                    bot_state["force_batch_limit"] = 6
+                    bot_state["active"] = True
+                    msg += "\nMonitor riavviato per il nuovo brand."
+                await telegram_send_text(client, chat_id, msg)
         elif callback_data.startswith("brand:"):
             brand_key = callback_data.removeprefix("brand:")
             if brand_key in BRANDS:
                 bot_state["brand"] = brand_key
-                bot_state["force_batch_limit"] = 6
+                bot_state["active"] = False
+                bot_state["awaiting_price_for_brand"] = True
                 await telegram_send_text(
-                    client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}."
+                    client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}. Ora scegli il prezzo massimo:", price_menu()
                 )
         return
 
@@ -326,9 +330,12 @@ async def process_telegram_update(
         if price:
             set_max_price(price_state, price)
             awaiting_custom_price.discard(chat_id)
-            await telegram_send_text(
-                client, chat_id, f"Prezzo massimo impostato a {price} €."
-            )
+            msg = f"Prezzo massimo impostato a {price} €."
+            if bot_state.pop("awaiting_price_for_brand", False):
+                bot_state["force_batch_limit"] = 6
+                bot_state["active"] = True
+                msg += "\nMonitor riavviato per il nuovo brand."
+            await telegram_send_text(client, chat_id, msg)
         else:
             await telegram_send_text(
                 client,
@@ -343,9 +350,12 @@ async def process_telegram_update(
             price = normalize_price(parts[1])
             if price:
                 set_max_price(price_state, price)
-                await telegram_send_text(
-                    client, chat_id, f"Prezzo massimo impostato a {price} €."
-                )
+                msg = f"Prezzo massimo impostato a {price} €."
+                if bot_state.pop("awaiting_price_for_brand", False):
+                    bot_state["force_batch_limit"] = 6
+                    bot_state["active"] = True
+                    msg += "\nMonitor riavviato per il nuovo brand."
+                await telegram_send_text(client, chat_id, msg)
             else:
                 await telegram_send_text(
                     client, chat_id, "Importo non valido. Usa, ad esempio, /prezzo 17,50."
