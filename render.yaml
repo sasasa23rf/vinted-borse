@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: vinted-bag-monitor
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: false
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: VINTED_POLL_SECONDS
+        value: "60"
