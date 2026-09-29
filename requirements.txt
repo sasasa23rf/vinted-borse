@@ -1,4 +1,0 @@
-httpx>=0.27,<1
-python-dotenv>=1,<2
-rembg>=2.0,<3
-onnxruntime>=1.17,<2
