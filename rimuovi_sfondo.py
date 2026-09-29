@@ -1,22 +1,23 @@
-"""Rimozione sfondo via Pixelcut: accetta bytes in RAM e restituisce bytes.
+"""Rimozione sfondo via Pixelcut — logica identica a esempio.py.
 
-La sequenza di pause/attese e i selettori restano quelli dello script originale
-che funzionava; cambia solo I/O (bytes in RAM + file temporanei).
+Differenze minime rispetto a esempio.py:
+- input/output in bytes (file temporanei, come serve al bot)
+- headless configurabile (su Render deve essere true)
+- esecuzione in processo separato per non confliggere con asyncio
 """
 
 from __future__ import annotations
 
-import logging
+import glob
 import os
 import re
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-logger = logging.getLogger("rimuovi-sfondo")
-
-# Su Render serve headless; in locale puoi impostare PIXELCUT_HEADLESS=false
+# Su Render non c'e display: default true. In locale: PIXELCUT_HEADLESS=false
 HEADLESS = os.getenv("PIXELCUT_HEADLESS", "true").strip().lower() not in {
     "0",
     "false",
@@ -24,37 +25,33 @@ HEADLESS = os.getenv("PIXELCUT_HEADLESS", "true").strip().lower() not in {
 }
 
 
-def _guess_suffix(image_bytes: bytes, fallback: str = ".jpg") -> str:
+def _guess_suffix(image_bytes: bytes) -> str:
     if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
     if image_bytes.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
         return ".webp"
-    return fallback
+    return ".jpg"
 
 
-def remove_background(image_bytes: bytes) -> bytes:
-    """Carica l'immagine su Pixelcut, scarica il risultato e lo restituisce in RAM."""
+def _remove_background_impl(image_bytes: bytes) -> bytes:
+    """Corpo = esempio.py main(), con foto in/out via file temporanei."""
     if not image_bytes:
         raise ValueError("Immagine vuota: impossibile rimuovere lo sfondo")
 
     suffix = _guess_suffix(image_bytes)
-    input_path: Path | None = None
-    output_path: Path | None = None
-
+    tmp_dir = tempfile.mkdtemp(prefix="pixelcut_")
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as input_file:
-            input_file.write(image_bytes)
-            input_path = Path(input_file.name)
+        foto_path = os.path.join(tmp_dir, f"foto{suffix}")
+        with open(foto_path, "wb") as handle:
+            handle.write(image_bytes)
 
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as output_file:
-            output_path = Path(output_file.name)
-
-        foto_path = str(input_path)
+        original_ext = os.path.splitext(foto_path)[1]
 
         with sync_playwright() as p:
             print("Avvio del browser...")
+            # headless=False in esempio.py; su Render serve True
             browser = p.chromium.launch(headless=HEADLESS)
             context = browser.new_context()
             page = context.new_page()
@@ -133,35 +130,64 @@ def remove_background(image_bytes: bytes) -> bytes:
                 free_btn.click(force=True)
             download = download_info.value
 
-            download.save_as(str(output_path))
-            print(f"Successo! Immagine elaborata: {output_path}")
+            # Salviamo il file nella stessa cartella con nome 'fotosenzasfondo'
+            save_path = os.path.join(tmp_dir, f"fotosenzasfondo{original_ext}")
+            download.save_as(save_path)
+
+            print(f"Successo! Immagine salvata in: {save_path}")
 
             browser.close()
 
-        result = output_path.read_bytes()
+        with open(save_path, "rb") as handle:
+            result = handle.read()
         if not result:
             raise RuntimeError("Download Pixelcut vuoto")
         return result
     finally:
-        if input_path is not None:
-            input_path.unlink(missing_ok=True)
-        if output_path is not None:
-            output_path.unlink(missing_ok=True)
+        for path in Path(tmp_dir).glob("*"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
 
 
-def main() -> None:
-    """Uso locale: cerca un file 'foto.*' e salva 'fotosenzasfondo'."""
-    current_dir = Path(__file__).resolve().parent
-    foto_path = next(current_dir.glob("foto.*"), None)
-    if foto_path is None or not foto_path.is_file():
+def remove_background(image_bytes: bytes) -> bytes:
+    """Esegue la logica di esempio.py in un processo figlio (safe con asyncio)."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+        future = executor.submit(_remove_background_impl, image_bytes)
+        return future.result(timeout=300)
+
+
+def find_foto():
+    """Trova un file che si chiama 'foto' con qualsiasi estensione nella cartella corrente."""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    for file_path in glob.glob(os.path.join(current_dir, "foto.*")):
+        if os.path.isfile(file_path):
+            return file_path
+    return None
+
+
+def main():
+    foto_path = find_foto()
+    if not foto_path:
         print("Errore: Nessun file denominato 'foto' trovato nella cartella corrente.")
         return
 
     print(f"File trovato: {foto_path}")
-    original_ext = foto_path.suffix
-    result = remove_background(foto_path.read_bytes())
-    save_path = current_dir / f"fotosenzasfondo{original_ext}"
-    save_path.write_bytes(result)
+    original_ext = os.path.splitext(foto_path)[1]
+    with open(foto_path, "rb") as handle:
+        result = _remove_background_impl(handle.read())
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    save_path = os.path.join(current_dir, f"fotosenzasfondo{original_ext}")
+    with open(save_path, "wb") as handle:
+        handle.write(result)
     print(f"Successo! Immagine salvata in: {save_path}")
 
 
