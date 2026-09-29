@@ -201,17 +201,66 @@ def select_new_item_urls(
     return selected_urls, None
 
 
-def _unique_image_urls(*groups: Collection[str]) -> list[str]:
-    unique: list[str] = []
-    seen: set[str] = set()
+def _clean_image_url(url: str) -> str:
+    cleaned = html.unescape(str(url or "")).strip()
+    cleaned = cleaned.rstrip("\\").rstrip("'").rstrip('"').strip()
+    if cleaned.startswith("//"):
+        cleaned = "https:" + cleaned
+    return cleaned
+
+
+def _photo_identity(url: str) -> str:
+    path = urlparse(url).path
+    match = re.search(r"/t/([^/]+)/", path)
+    if match:
+        return match.group(1)
+    return re.sub(r"/\d+x\d+/", "/", path)
+
+
+def _image_quality_score(url: str) -> int:
+    lowered = url.lower()
+    if "full_size" in lowered or "high_resolution" in lowered:
+        return 2_000_000
+    if "/f800/" in lowered:
+        return 800 * 800
+    if "/f600/" in lowered:
+        return 600 * 600
+    match = re.search(r"/(\d{2,4})x(\d{2,4})/", url)
+    if match:
+        return int(match.group(1)) * int(match.group(2))
+    return 400 * 400
+
+
+def _prefer_large_image_url(url: str) -> str:
+    """Se possibile, punta a una variante piu grande della stessa foto Vinted."""
+    if re.search(r"/\d{2,3}x\d{2,3}/", url):
+        return re.sub(r"/\d{2,3}x\d{2,3}/", "/f800/", url, count=1)
+    return url
+
+
+def _select_image_urls(*groups: Collection[str], max_images: int = 15) -> list[str]:
+    best_by_photo: OrderedDict[str, tuple[int, str]] = OrderedDict()
     for group in groups:
         for raw in group:
-            url = str(raw or "").strip()
-            if not url or url in seen:
+            url = _clean_image_url(raw)
+            if not url:
                 continue
-            seen.add(url)
-            unique.append(url)
-    return unique
+            if "vinted.net" not in url and "/photos/" not in url:
+                continue
+            url = _prefer_large_image_url(url)
+            score = _image_quality_score(url)
+            # Scarta miniature troppo piccole anche dopo l'upgrade fallito
+            size_match = re.search(r"/(\d{2,4})x(\d{2,4})/", url)
+            if size_match and int(size_match.group(1)) < 300 and int(size_match.group(2)) < 300:
+                continue
+            key = _photo_identity(url)
+            current = best_by_photo.get(key)
+            if current is None or score > current[0]:
+                best_by_photo[key] = (score, url)
+                best_by_photo.move_to_end(key)
+
+    ranked = sorted(best_by_photo.values(), key=lambda item: item[0], reverse=True)
+    return [url for _, url in ranked[:max_images]]
 
 
 def _extract_product_images(product: dict) -> list[str]:
@@ -225,19 +274,15 @@ def _extract_product_images(product: dict) -> list[str]:
 
 def _extract_page_image_urls(page_text: str) -> list[str]:
     patterns = (
-        r'https://[^"\'\s]+(?:vinted\.net|vinted\.[a-z.]+)/[^"\'\s]+\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s]*)?',
-        r'"url"\s*:\s*"(https://[^"]+/photos/[^"]+)"',
-        r'"full_size_url"\s*:\s*"(https://[^"]+)"',
-        r'"high_resolution"\s*:\s*\{\s*"url"\s*:\s*"(https://[^"]+)"',
+        r'"full_size_url"\s*:\s*"(https://[^"\\]+)"',
+        r'"high_resolution"\s*:\s*\{\s*"url"\s*:\s*"(https://[^"\\]+)"',
+        r'"url"\s*:\s*"(https://[^"\\]+/photos/[^"\\]+)"',
+        r'https://images\d*\.vinted\.net/[^"\'\\\s]+',
     )
     found: list[str] = []
     for pattern in patterns:
         found.extend(re.findall(pattern, page_text, flags=re.IGNORECASE))
-    return [
-        html.unescape(url)
-        for url in found
-        if "/photos/" in url or "vinted.net" in url
-    ]
+    return [_clean_image_url(url) for url in found]
 
 
 async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
@@ -263,7 +308,7 @@ async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
         del page_text
         raise RuntimeError("Prezzo non trovato nei dati prodotto Vinted")
     price = f"{Decimal(raw_price):.2f}".replace(".", ",") + " €"
-    image_urls = _unique_image_urls(
+    image_urls = _select_image_urls(
         _extract_product_images(product),
         _extract_page_image_urls(page_text),
     )
@@ -336,7 +381,7 @@ async def fetch_item_image_urls(
             product_images = _extract_product_images(json.loads(match.group(1)))
         except json.JSONDecodeError:
             product_images = []
-    image_urls = _unique_image_urls(product_images, _extract_page_image_urls(page_text))
+    image_urls = _select_image_urls(product_images, _extract_page_image_urls(page_text))
     del page_text
     if not image_urls:
         raise RuntimeError("Nessuna foto trovata nell'inserzione")
@@ -684,7 +729,18 @@ async def generate_images_job(
             item_id,
         )
         for image_url in image_urls:
-            stored_images.append(await download_image_bytes(vinted_client, image_url))
+            try:
+                stored_images.append(await download_image_bytes(vinted_client, image_url))
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                if status in {403, 404}:
+                    logger.warning(
+                        "Salto foto non scaricabile (%d): %s",
+                        status,
+                        image_url[:120],
+                    )
+                    continue
+                raise
 
         total = len(stored_images)
         if total == 0:
@@ -840,6 +896,7 @@ async def monitor() -> None:
                         item_urls, seen_items, limit
                     )
 
+                    processed_count = len(urls_to_process)
                     for item_url in urls_to_process:
                         item_id = item_id_from_url(item_url)
                         if item_id is None:
@@ -867,7 +924,7 @@ async def monitor() -> None:
                         logger.info(
                             "Raggiunta inserzione gia vista: ID %s", existing_item_id
                         )
-                    elif initial_batch and len(urls_to_process) >= INITIAL_BATCH_LIMIT:
+                    elif initial_batch and processed_count >= INITIAL_BATCH_LIMIT:
                         logger.info(
                             "Primo avvio: limite di %d inserzioni raggiunto",
                             INITIAL_BATCH_LIMIT,
