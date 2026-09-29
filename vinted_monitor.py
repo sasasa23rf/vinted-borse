@@ -19,6 +19,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from rimuovi_sfondo import remove_background
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 load_dotenv(ROOT_DIR / ".env")
@@ -186,6 +188,45 @@ def select_new_item_urls(
     return selected_urls, None
 
 
+def _unique_image_urls(*groups: Collection[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group:
+            url = str(raw or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def _extract_product_images(product: dict) -> list[str]:
+    image_field = product.get("image")
+    if isinstance(image_field, list):
+        return [str(url) for url in image_field if url]
+    if image_field:
+        return [str(image_field)]
+    return []
+
+
+def _extract_page_image_urls(page_text: str) -> list[str]:
+    patterns = (
+        r'https://[^"\'\s]+(?:vinted\.net|vinted\.[a-z.]+)/[^"\'\s]+\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s]*)?',
+        r'"url"\s*:\s*"(https://[^"]+/photos/[^"]+)"',
+        r'"full_size_url"\s*:\s*"(https://[^"]+)"',
+        r'"high_resolution"\s*:\s*\{\s*"url"\s*:\s*"(https://[^"]+)"',
+    )
+    found: list[str] = []
+    for pattern in patterns:
+        found.extend(re.findall(pattern, page_text, flags=re.IGNORECASE))
+    return [
+        html.unescape(url)
+        for url in found
+        if "/photos/" in url or "vinted.net" in url
+    ]
+
+
 async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
     response = await client.get(item_url, timeout=30)
     try:
@@ -199,26 +240,72 @@ async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
         page_text,
         re.DOTALL | re.IGNORECASE,
     )
-    del page_text
     if not match:
+        del page_text
         raise RuntimeError("Dati prodotto JSON-LD assenti nella pagina Vinted")
     product = json.loads(match.group(1))
     offers = product.get("offers", {})
     raw_price = normalize_price(str(offers.get("price", "")))
     if not raw_price:
+        del page_text
         raise RuntimeError("Prezzo non trovato nei dati prodotto Vinted")
     price = f"{Decimal(raw_price):.2f}".replace(".", ",") + " €"
-    image_url = product.get("image")
-    if isinstance(image_url, list):
-        image_url = image_url[0] if image_url else ""
-    if not image_url:
+    image_urls = _unique_image_urls(
+        _extract_product_images(product),
+        _extract_page_image_urls(page_text),
+    )
+    del page_text
+    if not image_urls:
         raise RuntimeError("URL immagine assente nei dati prodotto Vinted")
     return {
         "title": html.unescape(str(product.get("name", "Inserzione"))).strip(),
         "price": price,
         "description": html.unescape(str(product.get("description", "Descrizione non presente"))).strip(),
-        "image_url": str(image_url),
+        "image_url": image_urls[0],
+        "image_urls": image_urls,
         "item_url": canonical_item_url(str(offers.get("url") or item_final_url)),
+    }
+
+
+async def fetch_item_image_urls(client: httpx.AsyncClient, item_url: str) -> list[str]:
+    response = await client.get(item_url, timeout=30)
+    try:
+        response.raise_for_status()
+        page_text = response.text
+    finally:
+        await response.aclose()
+    product_images: list[str] = []
+    match = re.search(
+        r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+        page_text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if match:
+        try:
+            product_images = _extract_product_images(json.loads(match.group(1)))
+        except json.JSONDecodeError:
+            product_images = []
+    image_urls = _unique_image_urls(product_images, _extract_page_image_urls(page_text))
+    del page_text
+    if not image_urls:
+        raise RuntimeError("Nessuna foto trovata nell'inserzione")
+    return image_urls
+
+
+async def download_image_bytes(client: httpx.AsyncClient, image_url: str) -> bytes:
+    response = await client.get(image_url, timeout=60)
+    try:
+        response.raise_for_status()
+        return response.content
+    finally:
+        await response.aclose()
+
+
+def genera_immagini_keyboard(item_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "🟢 genera immagini", "callback_data": f"genimg:{item_id}"}]
+        ]
     }
 
 
@@ -311,6 +398,23 @@ async def process_telegram_update(
                 bot_state["force_batch_limit"] = 6
                 await telegram_send_text(
                     client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}."
+                )
+        elif callback_data.startswith("genimg:"):
+            item_id = callback_data.removeprefix("genimg:").strip()
+            if not item_id.isdigit():
+                await telegram_send_text(
+                    client, chat_id, "Link inserzione non valido per la generazione immagini."
+                )
+            elif bot_state.get("busy_images"):
+                await telegram_send_text(
+                    client,
+                    chat_id,
+                    "Generazione immagini gia in corso. Attendi la fine del processo.",
+                )
+            else:
+                bot_state["busy_images"] = True
+                asyncio.create_task(
+                    generate_images_job(client, item_id, bot_state)
                 )
         return
 
@@ -443,16 +547,17 @@ async def send_telegram_item(
     description_length = max(0, caption_limit - caption_overhead)
     caption = f"{heading}\n\n{description[:description_length]}\n\n{link_line}".strip()
     remaining_description = description[description_length:]
+    item_id = item_id_from_url(item["item_url"]) or ""
+    reply_markup = genera_immagini_keyboard(item_id) if item_id else None
 
-    await telegram_api_call(
-        client,
-        "sendPhoto",
-        {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "caption": caption,
-            "photo": item["image_url"],
-        },
-    )
+    photo_data: dict[str, str] = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "caption": caption,
+        "photo": item["image_url"],
+    }
+    if reply_markup is not None:
+        photo_data["reply_markup"] = json.dumps(reply_markup)
+    await telegram_api_call(client, "sendPhoto", photo_data)
 
     if remaining_description:
         chunks = [
@@ -465,6 +570,115 @@ async def send_telegram_item(
                 text = f"{chunk}\n\n{link_line}"
             data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
             await telegram_api_call(client, "sendMessage", data)
+
+
+async def send_telegram_photo_bytes(
+    client: httpx.AsyncClient,
+    image_bytes: bytes,
+    caption: str,
+    filename: str = "immagine.png",
+) -> None:
+    await telegram_api_call(
+        client,
+        "sendPhoto",
+        {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+        files={"photo": (filename, image_bytes, "image/png")},
+    )
+
+
+async def generate_images_job(
+    telegram_client: httpx.AsyncClient,
+    item_id: str,
+    bot_state: dict,
+) -> None:
+    item_url = f"https://www.vinted.it/items/{item_id}"
+    stored_images: list[bytes | None] = []
+    try:
+        await telegram_send_text(
+            telegram_client,
+            TELEGRAM_CHAT_ID,
+            "⏸️ Ricerca inserzioni in pausa.\n"
+            "Sto scaricando le foto dell'inserzione e rimuovendo lo sfondo…",
+        )
+
+        pool_limits = httpx.Limits(max_connections=5, max_keepalive_connections=2)
+        async with httpx.AsyncClient(
+            timeout=60,
+            headers=VINTED_HEADERS,
+            follow_redirects=True,
+            limits=pool_limits,
+        ) as vinted_client:
+            image_urls = await fetch_item_image_urls(vinted_client, item_url)
+            logger.info(
+                "Generazione immagini: trovate %d foto per item %s",
+                len(image_urls),
+                item_id,
+            )
+            for image_url in image_urls:
+                stored_images.append(await download_image_bytes(vinted_client, image_url))
+
+        total = len(stored_images)
+        if total == 0:
+            raise RuntimeError("Nessuna foto scaricata in RAM")
+
+        await telegram_send_text(
+            telegram_client,
+            TELEGRAM_CHAT_ID,
+            f"Foto caricate in memoria: {total}. Avvio rimozione sfondo…",
+        )
+
+        for index in range(len(stored_images)):
+            image_bytes = stored_images[index]
+            if image_bytes is None:
+                continue
+            stored_images[index] = None
+            try:
+                processed = await asyncio.to_thread(remove_background, image_bytes)
+            except Exception:
+                logger.exception(
+                    "Rimozione sfondo fallita per foto %d/%d (item %s)",
+                    index + 1,
+                    total,
+                    item_id,
+                )
+                del image_bytes
+                await telegram_send_text(
+                    telegram_client,
+                    TELEGRAM_CHAT_ID,
+                    f"Errore sulla foto {index + 1}/{total}: passaggio alla successiva.",
+                )
+                gc.collect()
+                continue
+
+            del image_bytes
+            try:
+                await send_telegram_photo_bytes(
+                    telegram_client,
+                    processed,
+                    caption=f"Immagine {index + 1}/{total} senza sfondo",
+                    filename=f"no_bg_{item_id}_{index + 1}.png",
+                )
+            finally:
+                del processed
+                gc.collect()
+
+        await telegram_send_text(
+            telegram_client,
+            TELEGRAM_CHAT_ID,
+            "✅ Generazione immagini completata.\nRiprendo la ricerca inserzioni.",
+        )
+    except Exception as error:
+        logger.exception("Generazione immagini fallita per item %s", item_id)
+        await telegram_send_text(
+            telegram_client,
+            TELEGRAM_CHAT_ID,
+            f"Generazione immagini interrotta ({type(error).__name__}).\n"
+            "Riprendo la ricerca inserzioni.",
+        )
+    finally:
+        stored_images.clear()
+        bot_state["busy_images"] = False
+        gc.collect()
 
 
 SEEN_ITEMS_FILE = ROOT_DIR / "seen_items.json"
@@ -497,7 +711,7 @@ async def monitor() -> None:
 
     seen_items: OrderedDict[str, None] = load_seen_items()
     price_state = load_price_state()
-    bot_state = {"active": True}
+    bot_state = {"active": True, "busy_images": False}
     initial_batch = not seen_items
     pool_limits = httpx.Limits(
         max_connections=5,
@@ -519,6 +733,9 @@ async def monitor() -> None:
             while True:
                 if not bot_state["active"]:
                     await asyncio.sleep(POLL_SECONDS)
+                    continue
+                if bot_state.get("busy_images"):
+                    await asyncio.sleep(2)
                     continue
 
                 cycle_price = price_state["value"]
