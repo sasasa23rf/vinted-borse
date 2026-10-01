@@ -17,6 +17,7 @@ import httpx
 from dotenv import load_dotenv
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -60,6 +61,20 @@ MAX_SEEN_ITEMS = 500
 DEFAULT_MAX_PRICE = os.getenv("DEFAULT_MAX_PRICE", "10").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL", "https://rcmnyppytatzlnewoosn.supabase.co"
+).strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_IMAGE_BUCKET = "product-images"
+MAX_PRODUCT_IMAGE_SIZE = 10 * 1024 * 1024
+PRODUCTS_PAGE_SIZE = 8
+ALLOWED_PRODUCT_IMAGE_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/avif": "avif",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -254,6 +269,215 @@ async def telegram_send_text(
     return await telegram_api_call(client, "sendMessage", data)
 
 
+def supabase_headers() -> dict[str, str]:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "Configura SUPABASE_SERVICE_ROLE_KEY (e SUPABASE_URL, se diverso) nell'ambiente"
+        )
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+
+async def supabase_request(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+    *,
+    params: list[tuple[str, str]] | None = None,
+    json_body: dict | None = None,
+    content: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict | list | None:
+    request_headers = supabase_headers()
+    if headers:
+        request_headers.update(headers)
+    try:
+        response = await client.request(
+            method,
+            f"{SUPABASE_URL}{path}",
+            params=params,
+            json=json_body,
+            content=content,
+            headers=request_headers,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        raise RuntimeError(
+            f"Supabase ha rifiutato la richiesta (HTTP {error.response.status_code})"
+        ) from None
+    except httpx.HTTPError as error:
+        raise RuntimeError(
+            f"Connessione a Supabase non riuscita ({type(error).__name__})"
+        ) from None
+    if not response.content:
+        return None
+    return response.json()
+
+
+async def upload_telegram_image(
+    client: httpx.AsyncClient, message: dict, chat_id: str
+) -> str:
+    photos = message.get("photo") or []
+    document = message.get("document") or {}
+    if photos:
+        attachment = max(photos, key=lambda photo: int(photo.get("file_size", 0)))
+        file_id = str(attachment["file_id"])
+        content_type = "image/jpeg"
+    elif document:
+        content_type = str(document.get("mime_type", "")).lower()
+        file_id = str(document.get("file_id", ""))
+    else:
+        raise RuntimeError("Invia una foto o un file immagine supportato.")
+
+    extension = ALLOWED_PRODUCT_IMAGE_TYPES.get(content_type)
+    if not extension or not file_id:
+        raise RuntimeError("Formato immagine non supportato. Usa JPG, PNG, WEBP, GIF o AVIF.")
+
+    file_result = await telegram_api_call(client, "getFile", {"file_id": file_id})
+    file_path = str(file_result.get("result", {}).get("file_path", ""))
+    if not file_path:
+        raise RuntimeError("Telegram non ha reso disponibile il file.")
+    try:
+        response = await client.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        raise RuntimeError(
+            f"Download immagine da Telegram non riuscito ({type(error).__name__})"
+        ) from None
+    if len(response.content) > MAX_PRODUCT_IMAGE_SIZE:
+        raise RuntimeError("L'immagine supera il limite di 10 MB.")
+
+    storage_path = f"telegram/{chat_id}/{uuid.uuid4()}.{extension}"
+    await supabase_request(
+        client,
+        "POST",
+        f"/storage/v1/object/{SUPABASE_IMAGE_BUCKET}/{storage_path}",
+        content=response.content,
+        headers={"Content-Type": content_type, "x-upsert": "false"},
+    )
+    return storage_path
+
+
+async def delete_product_images(client: httpx.AsyncClient, paths: list[str]) -> None:
+    if paths:
+        await supabase_request(
+            client,
+            "DELETE",
+            f"/storage/v1/object/{SUPABASE_IMAGE_BUCKET}",
+            json_body={"prefixes": paths},
+        )
+
+
+async def show_products_page(
+    client: httpx.AsyncClient, chat_id: str, offset: int
+) -> None:
+    offset = max(0, offset)
+    products = await supabase_request(
+        client,
+        "GET",
+        "/rest/v1/products",
+        params=[
+            ("select", "id,name"),
+            ("order", "created_at.desc"),
+            ("limit", str(PRODUCTS_PAGE_SIZE + 1)),
+            ("offset", str(offset)),
+        ],
+    )
+    products = products if isinstance(products, list) else []
+    has_next = len(products) > PRODUCTS_PAGE_SIZE
+    products = products[:PRODUCTS_PAGE_SIZE]
+    if not products and offset:
+        await show_products_page(client, chat_id, max(0, offset - PRODUCTS_PAGE_SIZE))
+        return
+    if not products:
+        await telegram_send_text(client, chat_id, "Non ci sono prodotti da gestire.")
+        return
+
+    keyboard = [
+        [{
+            "text": str(product.get("name", "Prodotto"))[:60],
+            "callback_data": f"product:select:{product['id']}:{offset}",
+        }]
+        for product in products
+    ]
+    navigation = []
+    if offset:
+        navigation.append({"text": "← Precedenti", "callback_data": f"products:page:{max(0, offset - PRODUCTS_PAGE_SIZE)}"})
+    if has_next:
+        navigation.append({"text": "Successivi →", "callback_data": f"products:page:{offset + PRODUCTS_PAGE_SIZE}"})
+    if navigation:
+        keyboard.append(navigation)
+    await telegram_send_text(
+        client,
+        chat_id,
+        f"Prodotti {offset + 1}-{offset + len(products)}. Seleziona un prodotto per eliminarlo:",
+        {"inline_keyboard": keyboard},
+    )
+
+
+async def ask_delete_product(
+    client: httpx.AsyncClient, chat_id: str, product_id: str, offset: int
+) -> None:
+    product_id = str(uuid.UUID(product_id))
+    result = await supabase_request(
+        client,
+        "GET",
+        "/rest/v1/products",
+        params=[("select", "name"), ("id", f"eq.{product_id}"), ("limit", "1")],
+    )
+    if not isinstance(result, list) or not result:
+        await telegram_send_text(client, chat_id, "Prodotto non trovato; aggiorno la lista.")
+        await show_products_page(client, chat_id, offset)
+        return
+    name = str(result[0].get("name", "Prodotto"))
+    await telegram_send_text(
+        client,
+        chat_id,
+        f"Confermi l'eliminazione di «{name}»?",
+        {"inline_keyboard": [[
+            {"text": "Elimina", "callback_data": f"product:delete:{product_id}:{offset}"},
+            {"text": "Annulla", "callback_data": f"products:page:{offset}"},
+        ]]},
+    )
+
+
+async def remove_product(
+    client: httpx.AsyncClient, chat_id: str, product_id: str, offset: int
+) -> None:
+    product_id = str(uuid.UUID(product_id))
+    result = await supabase_request(
+        client,
+        "GET",
+        "/rest/v1/products",
+        params=[("select", "images"), ("id", f"eq.{product_id}"), ("limit", "1")],
+    )
+    if not isinstance(result, list) or not result:
+        await telegram_send_text(client, chat_id, "Il prodotto è già stato eliminato.")
+        await show_products_page(client, chat_id, offset)
+        return
+    await supabase_request(
+        client,
+        "DELETE",
+        "/rest/v1/products",
+        params=[("id", f"eq.{product_id}")],
+    )
+    cleanup_failed = False
+    try:
+        await delete_product_images(client, result[0].get("images") or [])
+    except Exception:
+        cleanup_failed = True
+        logger.exception("Prodotto eliminato, ma non è stato possibile rimuovere le immagini")
+    message = "Prodotto eliminato."
+    if cleanup_failed:
+        message += " Alcune immagini potrebbero essere ancora nello Storage."
+    await telegram_send_text(client, chat_id, message)
+    await show_products_page(client, chat_id, offset)
+
+
 def price_menu() -> dict:
     values = ("5", "10", "15", "20", "30", "50")
     buttons = [
@@ -292,7 +516,36 @@ async def process_telegram_update(
             {"callback_query_id": str(callback["id"])},
         )
         callback_data = str(callback.get("data", ""))
-        if callback_data == "max:custom":
+        if callback_data == "upload:done":
+            session = bot_state.get("product_sessions", {}).get(chat_id)
+            if session and session.get("step") == "images":
+                if not session["images"]:
+                    await telegram_send_text(client, chat_id, "Invia almeno un'immagine prima di continuare.")
+                else:
+                    session["step"] = "description"
+                    await telegram_send_text(client, chat_id, "Ora scrivi la descrizione del prodotto.")
+        elif callback_data.startswith("products:page:"):
+            try:
+                await show_products_page(client, chat_id, int(callback_data.rsplit(":", 1)[1]))
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non riesco a caricare i prodotti: {error}")
+        elif callback_data.startswith("product:select:"):
+            try:
+                _, _, product_id, offset = callback_data.split(":", 3)
+                await ask_delete_product(client, chat_id, product_id, int(offset))
+            except (ValueError, IndexError):
+                await telegram_send_text(client, chat_id, "Selezione prodotto non valida.")
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non riesco a leggere il prodotto: {error}")
+        elif callback_data.startswith("product:delete:"):
+            try:
+                _, _, product_id, offset = callback_data.split(":", 3)
+                await remove_product(client, chat_id, product_id, int(offset))
+            except (ValueError, IndexError):
+                await telegram_send_text(client, chat_id, "Selezione prodotto non valida.")
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non riesco a eliminare il prodotto: {error}")
+        elif callback_data == "max:custom":
             awaiting_custom_price.add(chat_id)
             await telegram_send_text(
                 client, chat_id, "Scrivi il nuovo prezzo massimo in euro (es. 17,50)."
@@ -317,10 +570,63 @@ async def process_telegram_update(
     message = update.get("message", {})
     chat_id = str(message.get("chat", {}).get("id", ""))
     text = str(message.get("text", "")).strip()
-    if chat_id != TELEGRAM_CHAT_ID or not text:
+    if chat_id != TELEGRAM_CHAT_ID:
         return
 
-    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+    product_sessions = bot_state.setdefault("product_sessions", {})
+
+    if command == "/carica":
+        if not SUPABASE_SERVICE_ROLE_KEY:
+            await telegram_send_text(
+                client,
+                chat_id,
+                "Per caricare prodotti configura SUPABASE_SERVICE_ROLE_KEY nell'ambiente del bot.",
+            )
+        elif chat_id in product_sessions:
+            await telegram_send_text(client, chat_id, "Hai già un caricamento in corso. Usa /annulla per interromperlo.")
+        else:
+            awaiting_custom_price.discard(chat_id)
+            product_sessions[chat_id] = {"step": "name", "images": []}
+            await telegram_send_text(client, chat_id, "Qual è il nome del prodotto?")
+        return
+    if command == "/prodotti":
+        try:
+            await show_products_page(client, chat_id, 0)
+        except Exception as error:
+            await telegram_send_text(client, chat_id, f"Non riesco a caricare i prodotti: {error}")
+        return
+    if command in {"/annulla", "/cancel"}:
+        session = product_sessions.pop(chat_id, None)
+        if session and session.get("images"):
+            try:
+                await delete_product_images(client, session["images"])
+            except Exception as error:
+                await telegram_send_text(
+                    client, chat_id, f"Caricamento annullato; non sono riuscito a rimuovere tutte le immagini: {error}"
+                )
+                return
+        await telegram_send_text(client, chat_id, "Caricamento annullato." if session else "Non c'è un caricamento in corso.")
+        return
+
+    session = product_sessions.get(chat_id)
+    if session and session.get("step") == "images" and (message.get("photo") or message.get("document")):
+        try:
+            storage_path = await upload_telegram_image(client, message, chat_id)
+            session["images"].append(storage_path)
+            await telegram_send_text(
+                client,
+                chat_id,
+                f"Immagine {len(session['images'])} caricata. Invia altre foto oppure premi Fine immagini.",
+                {"inline_keyboard": [[{"text": "Fine immagini", "callback_data": "upload:done"}]]},
+            )
+        except Exception as error:
+            await telegram_send_text(client, chat_id, f"Impossibile caricare l'immagine: {error}")
+        return
+
+    if not text:
+        return
+
     if chat_id in awaiting_custom_price and not text.startswith("/"):
         price = normalize_price(text)
         if price:
@@ -357,25 +663,90 @@ async def process_telegram_update(
             f"Prezzo massimo attuale: {price_state['value']} €. Scegli un importo:",
             price_menu(),
         )
-    elif command == "/start":
+        return
+    if command == "/start":
         bot_state["active"] = True
         await telegram_send_text(
-            client, chat_id, "Monitor Vinted avviato! Usa /prezzo per cambiare il prezzo massimo o /stop per fermarlo."
+            client,
+            chat_id,
+            "Monitor Vinted avviato. Comandi: /prezzo, /brand, /carica, /prodotti, /annulla, /stop.",
         )
-    elif command == "/stop":
+        return
+    if command == "/stop":
         bot_state["active"] = False
         await telegram_send_text(
             client, chat_id, "Monitor Vinted fermato. Usa /start per riavviarlo."
         )
-    elif command == "/brand":
-        current_brand = str(bot_state.get('brand', 'michael_kors'))
+        return
+    if command == "/brand":
+        current_brand = str(bot_state.get("brand", "michael_kors"))
         await telegram_send_text(
             client,
             chat_id,
             f"Brand attuale: {BRANDS[current_brand]['name']}. Scegli un brand:",
             brand_menu(),
         )
+        return
 
+    session = product_sessions.get(chat_id)
+    if session:
+        step = session.get("step")
+        if step == "name":
+            if text.startswith("/"):
+                await telegram_send_text(client, chat_id, "Scrivi il nome del prodotto oppure usa /annulla.")
+            else:
+                session["name"] = text[:200]
+                session["step"] = "images"
+                await telegram_send_text(
+                    client,
+                    chat_id,
+                    "Invia una o più immagini del prodotto. Quando hai finito premi Fine immagini.",
+                    {"inline_keyboard": [[{"text": "Fine immagini", "callback_data": "upload:done"}]]},
+                )
+            return
+        if step == "images":
+            if text.lower() in {"fine", "fine immagini", "fatto"}:
+                if session["images"]:
+                    session["step"] = "description"
+                    await telegram_send_text(client, chat_id, "Ora scrivi la descrizione del prodotto.")
+                else:
+                    await telegram_send_text(client, chat_id, "Invia almeno un'immagine prima di continuare.")
+            else:
+                await telegram_send_text(client, chat_id, "Invia un'immagine oppure premi Fine immagini.")
+            return
+        if step == "description":
+            if text.startswith("/"):
+                await telegram_send_text(client, chat_id, "Scrivi la descrizione oppure usa /annulla.")
+            else:
+                session["description"] = text
+                session["step"] = "price"
+                await telegram_send_text(client, chat_id, "Qual è il prezzo del prodotto in euro? (es. 25,50)")
+            return
+        if step == "price":
+            price = normalize_price(text)
+            if not price:
+                await telegram_send_text(client, chat_id, "Prezzo non valido. Inserisci un importo maggiore di zero, ad esempio 25,50.")
+                return
+            try:
+                await supabase_request(
+                    client,
+                    "POST",
+                    "/rest/v1/products",
+                    json_body={
+                        "name": session["name"],
+                        "description": session["description"],
+                        "price": price,
+                        "images": session["images"],
+                        "is_visible": True,
+                    },
+                    headers={"Prefer": "return=minimal"},
+                )
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non sono riuscito a salvare il prodotto: {error}. Puoi riprovare il prezzo o usare /annulla.")
+                return
+            product_sessions.pop(chat_id, None)
+            await telegram_send_text(client, chat_id, f"Prodotto «{session['name']}» caricato correttamente nella vetrina.")
+            return
 
 async def telegram_command_listener(
     client: httpx.AsyncClient, price_state: dict[str, str], bot_state: dict
