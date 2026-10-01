@@ -17,6 +17,7 @@ import httpx
 from dotenv import load_dotenv
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -60,9 +61,20 @@ MAX_SEEN_ITEMS = 500
 DEFAULT_MAX_PRICE = os.getenv("DEFAULT_MAX_PRICE", "10").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-CLOUDFLARE_API_URL = os.getenv("CLOUDFLARE_API_URL", "").strip().rstrip("/")
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-MAX_SALE_PHOTOS = 10
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL", "https://rcmnyppytatzlnewoosn.supabase.co"
+).strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_IMAGE_BUCKET = "product-images"
+MAX_PRODUCT_IMAGE_SIZE = 10 * 1024 * 1024
+PRODUCTS_PAGE_SIZE = 8
+ALLOWED_PRODUCT_IMAGE_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/avif": "avif",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -151,56 +163,8 @@ class CatalogLinkParser(HTMLParser):
             self.urls.append(urljoin("https://www.vinted.it", html.unescape(href)))
 
 
-def log_vinted_response(response: httpx.Response, operation: str, started_at: float) -> None:
-    elapsed_ms = (time.perf_counter() - started_at) * 1000
-    redirect_chain = " -> ".join(
-        f"{entry.status_code}:{entry.url.host}" for entry in response.history
-    ) or "none"
-    details = {
-        "status": response.status_code,
-        "elapsed_ms": round(elapsed_ms),
-        "host": response.url.host,
-        "path": response.url.path,
-        "content_type": response.headers.get("content-type", "unknown"),
-        "content_length": response.headers.get("content-length", "unknown"),
-        "server": response.headers.get("server", "unknown"),
-        "cf_ray": response.headers.get("cf-ray", "none"),
-        "request_id": response.headers.get("x-request-id", "none"),
-        "retry_after": response.headers.get("retry-after", "none"),
-        "redirects": redirect_chain,
-    }
-    if response.is_error:
-        logger.warning("Vinted %s response: %s", operation, details)
-        if response.status_code == 403:
-            preview = response.text[:2000]
-            preview = re.sub(
-                r"<(script|style)[^>]*>.*?</\1>", " ", preview,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            preview = re.sub(r"<[^>]+>", " ", preview)
-            preview = re.sub(r"\s+", " ", html.unescape(preview)).strip()[:240]
-            logger.warning("Vinted 403 diagnostic body preview: %r", preview)
-    else:
-        logger.info("Vinted %s response: %s", operation, details)
-
-
 async def listing_item_urls(client: httpx.AsyncClient, max_price: str, brand_key: str = "michael_kors") -> list[str]:
-    request_url = catalog_url(max_price, brand_key)
-    logger.info(
-        "Vinted catalog request start: brand=%s price_max=%s host=%s path=%s user_agent=%s",
-        brand_key,
-        max_price,
-        urlparse(request_url).netloc,
-        urlparse(request_url).path,
-        VINTED_HEADERS.get("User-Agent", "unset"),
-    )
-    started_at = time.perf_counter()
-    try:
-        response = await client.get(request_url, timeout=30)
-    except httpx.HTTPError:
-        logger.exception("Vinted catalog request failed before receiving an HTTP response")
-        raise
-    log_vinted_response(response, "catalog", started_at)
+    response = await client.get(catalog_url(max_price, brand_key), timeout=30)
     try:
         response.raise_for_status()
         page_text = response.text
@@ -216,11 +180,6 @@ async def listing_item_urls(client: httpx.AsyncClient, max_price: str, brand_key
         if item_id and item_id not in found_ids:
             found_ids.add(item_id)
             unique_urls.append(url)
-    logger.info(
-        "Vinted catalog parsing complete: raw_item_links=%d unique_item_links=%d",
-        len(parser.urls),
-        len(unique_urls),
-    )
     return unique_urls
 
 
@@ -243,15 +202,7 @@ def select_new_item_urls(
 
 
 async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
-    item_id = item_id_from_url(item_url) or "unknown"
-    started_at = time.perf_counter()
-    logger.info("Vinted item request start: item_id=%s host=%s", item_id, urlparse(item_url).netloc)
-    try:
-        response = await client.get(item_url, timeout=30)
-    except httpx.HTTPError:
-        logger.exception("Vinted item request failed before receiving an HTTP response: item_id=%s", item_id)
-        raise
-    log_vinted_response(response, f"item:{item_id}", started_at)
+    response = await client.get(item_url, timeout=30)
     try:
         response.raise_for_status()
         page_text = response.text
@@ -265,7 +216,6 @@ async def read_item(client: httpx.AsyncClient, item_url: str) -> dict[str, str]:
     )
     del page_text
     if not match:
-        logger.warning("Vinted item data missing JSON-LD: item_id=%s final_host=%s final_path=%s", item_id, urlparse(item_final_url).netloc, urlparse(item_final_url).path)
         raise RuntimeError("Dati prodotto JSON-LD assenti nella pagina Vinted")
     product = json.loads(match.group(1))
     offers = product.get("offers", {})
@@ -319,6 +269,215 @@ async def telegram_send_text(
     return await telegram_api_call(client, "sendMessage", data)
 
 
+def supabase_headers() -> dict[str, str]:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "Configura SUPABASE_SERVICE_ROLE_KEY (e SUPABASE_URL, se diverso) nell'ambiente"
+        )
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+
+async def supabase_request(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+    *,
+    params: list[tuple[str, str]] | None = None,
+    json_body: dict | None = None,
+    content: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict | list | None:
+    request_headers = supabase_headers()
+    if headers:
+        request_headers.update(headers)
+    try:
+        response = await client.request(
+            method,
+            f"{SUPABASE_URL}{path}",
+            params=params,
+            json=json_body,
+            content=content,
+            headers=request_headers,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        raise RuntimeError(
+            f"Supabase ha rifiutato la richiesta (HTTP {error.response.status_code})"
+        ) from None
+    except httpx.HTTPError as error:
+        raise RuntimeError(
+            f"Connessione a Supabase non riuscita ({type(error).__name__})"
+        ) from None
+    if not response.content:
+        return None
+    return response.json()
+
+
+async def upload_telegram_image(
+    client: httpx.AsyncClient, message: dict, chat_id: str
+) -> str:
+    photos = message.get("photo") or []
+    document = message.get("document") or {}
+    if photos:
+        attachment = max(photos, key=lambda photo: int(photo.get("file_size", 0)))
+        file_id = str(attachment["file_id"])
+        content_type = "image/jpeg"
+    elif document:
+        content_type = str(document.get("mime_type", "")).lower()
+        file_id = str(document.get("file_id", ""))
+    else:
+        raise RuntimeError("Invia una foto o un file immagine supportato.")
+
+    extension = ALLOWED_PRODUCT_IMAGE_TYPES.get(content_type)
+    if not extension or not file_id:
+        raise RuntimeError("Formato immagine non supportato. Usa JPG, PNG, WEBP, GIF o AVIF.")
+
+    file_result = await telegram_api_call(client, "getFile", {"file_id": file_id})
+    file_path = str(file_result.get("result", {}).get("file_path", ""))
+    if not file_path:
+        raise RuntimeError("Telegram non ha reso disponibile il file.")
+    try:
+        response = await client.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        raise RuntimeError(
+            f"Download immagine da Telegram non riuscito ({type(error).__name__})"
+        ) from None
+    if len(response.content) > MAX_PRODUCT_IMAGE_SIZE:
+        raise RuntimeError("L'immagine supera il limite di 10 MB.")
+
+    storage_path = f"telegram/{chat_id}/{uuid.uuid4()}.{extension}"
+    await supabase_request(
+        client,
+        "POST",
+        f"/storage/v1/object/{SUPABASE_IMAGE_BUCKET}/{storage_path}",
+        content=response.content,
+        headers={"Content-Type": content_type, "x-upsert": "false"},
+    )
+    return storage_path
+
+
+async def delete_product_images(client: httpx.AsyncClient, paths: list[str]) -> None:
+    if paths:
+        await supabase_request(
+            client,
+            "DELETE",
+            f"/storage/v1/object/{SUPABASE_IMAGE_BUCKET}",
+            json_body={"prefixes": paths},
+        )
+
+
+async def show_products_page(
+    client: httpx.AsyncClient, chat_id: str, offset: int
+) -> None:
+    offset = max(0, offset)
+    products = await supabase_request(
+        client,
+        "GET",
+        "/rest/v1/products",
+        params=[
+            ("select", "id,name"),
+            ("order", "created_at.desc"),
+            ("limit", str(PRODUCTS_PAGE_SIZE + 1)),
+            ("offset", str(offset)),
+        ],
+    )
+    products = products if isinstance(products, list) else []
+    has_next = len(products) > PRODUCTS_PAGE_SIZE
+    products = products[:PRODUCTS_PAGE_SIZE]
+    if not products and offset:
+        await show_products_page(client, chat_id, max(0, offset - PRODUCTS_PAGE_SIZE))
+        return
+    if not products:
+        await telegram_send_text(client, chat_id, "Non ci sono prodotti da gestire.")
+        return
+
+    keyboard = [
+        [{
+            "text": str(product.get("name", "Prodotto"))[:60],
+            "callback_data": f"product:select:{product['id']}:{offset}",
+        }]
+        for product in products
+    ]
+    navigation = []
+    if offset:
+        navigation.append({"text": "← Precedenti", "callback_data": f"products:page:{max(0, offset - PRODUCTS_PAGE_SIZE)}"})
+    if has_next:
+        navigation.append({"text": "Successivi →", "callback_data": f"products:page:{offset + PRODUCTS_PAGE_SIZE}"})
+    if navigation:
+        keyboard.append(navigation)
+    await telegram_send_text(
+        client,
+        chat_id,
+        f"Prodotti {offset + 1}-{offset + len(products)}. Seleziona un prodotto per eliminarlo:",
+        {"inline_keyboard": keyboard},
+    )
+
+
+async def ask_delete_product(
+    client: httpx.AsyncClient, chat_id: str, product_id: str, offset: int
+) -> None:
+    product_id = str(uuid.UUID(product_id))
+    result = await supabase_request(
+        client,
+        "GET",
+        "/rest/v1/products",
+        params=[("select", "name"), ("id", f"eq.{product_id}"), ("limit", "1")],
+    )
+    if not isinstance(result, list) or not result:
+        await telegram_send_text(client, chat_id, "Prodotto non trovato; aggiorno la lista.")
+        await show_products_page(client, chat_id, offset)
+        return
+    name = str(result[0].get("name", "Prodotto"))
+    await telegram_send_text(
+        client,
+        chat_id,
+        f"Confermi l'eliminazione di «{name}»?",
+        {"inline_keyboard": [[
+            {"text": "Elimina", "callback_data": f"product:delete:{product_id}:{offset}"},
+            {"text": "Annulla", "callback_data": f"products:page:{offset}"},
+        ]]},
+    )
+
+
+async def remove_product(
+    client: httpx.AsyncClient, chat_id: str, product_id: str, offset: int
+) -> None:
+    product_id = str(uuid.UUID(product_id))
+    result = await supabase_request(
+        client,
+        "GET",
+        "/rest/v1/products",
+        params=[("select", "images"), ("id", f"eq.{product_id}"), ("limit", "1")],
+    )
+    if not isinstance(result, list) or not result:
+        await telegram_send_text(client, chat_id, "Il prodotto è già stato eliminato.")
+        await show_products_page(client, chat_id, offset)
+        return
+    await supabase_request(
+        client,
+        "DELETE",
+        "/rest/v1/products",
+        params=[("id", f"eq.{product_id}")],
+    )
+    cleanup_failed = False
+    try:
+        await delete_product_images(client, result[0].get("images") or [])
+    except Exception:
+        cleanup_failed = True
+        logger.exception("Prodotto eliminato, ma non è stato possibile rimuovere le immagini")
+    message = "Prodotto eliminato."
+    if cleanup_failed:
+        message += " Alcune immagini potrebbero essere ancora nello Storage."
+    await telegram_send_text(client, chat_id, message)
+    await show_products_page(client, chat_id, offset)
+
+
 def price_menu() -> dict:
     values = ("5", "10", "15", "20", "30", "50")
     buttons = [
@@ -336,59 +495,6 @@ def brand_menu() -> dict:
     ]
     rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
     return {"inline_keyboard": rows}
-
-
-def sale_photo_menu() -> dict:
-    return {"inline_keyboard": [[{"text": "Fine foto", "callback_data": "sale:done_photos"}]]}
-
-
-async def telegram_download_photo(client: httpx.AsyncClient, file_id: str) -> bytes:
-    response = await client.get(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
-        params={"file_id": file_id},
-    )
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError("Telegram non ha restituito il file della foto")
-    file_path = str(result["result"]["file_path"])
-    response = await client.get(
-        f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-    )
-    response.raise_for_status()
-    return response.content
-
-
-async def publish_sale(
-    client: httpx.AsyncClient, chat_id: str, sale: dict
-) -> None:
-    if not CLOUDFLARE_API_URL or not CLOUDFLARE_API_TOKEN:
-        await telegram_send_text(
-            client,
-            chat_id,
-            "Configurazione Cloudflare mancante: imposta CLOUDFLARE_API_URL e CLOUDFLARE_API_TOKEN.",
-        )
-        return
-
-    files = []
-    for index, file_id in enumerate(sale["photos"], start=1):
-        image = await telegram_download_photo(client, file_id)
-        files.append(("photos", (f"foto-{index}.jpg", image, "image/jpeg")))
-
-    response = await client.post(
-        f"{CLOUDFLARE_API_URL}/api/listings",
-        headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
-        data={"description": sale["description"], "price": sale["price"]},
-        files=files,
-        timeout=90,
-    )
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError("Cloudflare non ha salvato l'annuncio")
-    await telegram_send_text(
-        client, chat_id, "Annuncio pubblicato sul sito."
-    )
 
 
 async def process_telegram_update(
@@ -410,13 +516,35 @@ async def process_telegram_update(
             {"callback_query_id": str(callback["id"])},
         )
         callback_data = str(callback.get("data", ""))
-        if callback_data == "sale:done_photos":
-            sale = bot_state.get("sale_sessions", {}).get(chat_id)
-            if sale and sale.get("step") == "photos" and sale["photos"]:
-                sale["step"] = "description"
-                await telegram_send_text(client, chat_id, "Ora invia la descrizione dell'articolo.")
-            else:
-                await telegram_send_text(client, chat_id, "Invia almeno una foto prima di continuare.")
+        if callback_data == "upload:done":
+            session = bot_state.get("product_sessions", {}).get(chat_id)
+            if session and session.get("step") == "images":
+                if not session["images"]:
+                    await telegram_send_text(client, chat_id, "Invia almeno un'immagine prima di continuare.")
+                else:
+                    session["step"] = "description"
+                    await telegram_send_text(client, chat_id, "Ora scrivi la descrizione del prodotto.")
+        elif callback_data.startswith("products:page:"):
+            try:
+                await show_products_page(client, chat_id, int(callback_data.rsplit(":", 1)[1]))
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non riesco a caricare i prodotti: {error}")
+        elif callback_data.startswith("product:select:"):
+            try:
+                _, _, product_id, offset = callback_data.split(":", 3)
+                await ask_delete_product(client, chat_id, product_id, int(offset))
+            except (ValueError, IndexError):
+                await telegram_send_text(client, chat_id, "Selezione prodotto non valida.")
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non riesco a leggere il prodotto: {error}")
+        elif callback_data.startswith("product:delete:"):
+            try:
+                _, _, product_id, offset = callback_data.split(":", 3)
+                await remove_product(client, chat_id, product_id, int(offset))
+            except (ValueError, IndexError):
+                await telegram_send_text(client, chat_id, "Selezione prodotto non valida.")
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non riesco a eliminare il prodotto: {error}")
         elif callback_data == "max:custom":
             awaiting_custom_price.add(chat_id)
             await telegram_send_text(
@@ -446,66 +574,55 @@ async def process_telegram_update(
         return
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
-    sale_sessions = bot_state.setdefault("sale_sessions", {})
-    if command == "/vendita":
-        if not CLOUDFLARE_API_URL or not CLOUDFLARE_API_TOKEN:
+    product_sessions = bot_state.setdefault("product_sessions", {})
+
+    if command == "/carica":
+        if not SUPABASE_SERVICE_ROLE_KEY:
             await telegram_send_text(
                 client,
                 chat_id,
-                "Prima configura CLOUDFLARE_API_URL e CLOUDFLARE_API_TOKEN per pubblicare gli annunci.",
+                "Per caricare prodotti configura SUPABASE_SERVICE_ROLE_KEY nell'ambiente del bot.",
             )
-            return
-        sale_sessions[chat_id] = {"step": "photos", "photos": []}
-        await telegram_send_text(
-            client,
-            chat_id,
-            "Invia le foto dell'articolo, anche in più messaggi. Quando hai finito premi Fine foto. (Massimo 10)",
-            sale_photo_menu(),
-        )
+        elif chat_id in product_sessions:
+            await telegram_send_text(client, chat_id, "Hai già un caricamento in corso. Usa /annulla per interromperlo.")
+        else:
+            awaiting_custom_price.discard(chat_id)
+            product_sessions[chat_id] = {"step": "name", "images": []}
+            await telegram_send_text(client, chat_id, "Qual è il nome del prodotto?")
         return
-    if command == "/annulla" and chat_id in sale_sessions:
-        sale_sessions.pop(chat_id, None)
-        await telegram_send_text(client, chat_id, "Inserimento annuncio annullato.")
+    if command == "/prodotti":
+        try:
+            await show_products_page(client, chat_id, 0)
+        except Exception as error:
+            await telegram_send_text(client, chat_id, f"Non riesco a caricare i prodotti: {error}")
         return
-
-    sale = sale_sessions.get(chat_id)
-    if sale and sale.get("step") == "photos" and message.get("photo"):
-        if len(sale["photos"]) >= MAX_SALE_PHOTOS:
-            await telegram_send_text(client, chat_id, "Hai raggiunto il limite di 10 foto. Premi Fine foto per continuare.")
-            return
-        sale["photos"].append(str(message["photo"][-1]["file_id"]))
-        await telegram_send_text(
-            client,
-            chat_id,
-            f"Foto ricevuta ({len(sale['photos'])}/10). Invia altre foto o premi Fine foto.",
-            sale_photo_menu(),
-        )
-        return
-
-    if sale and text and not text.startswith("/"):
-        if sale.get("step") == "description":
-            if len(text) > 5000:
-                await telegram_send_text(client, chat_id, "Descrizione troppo lunga. Usa al massimo 5000 caratteri.")
-                return
-            sale["description"] = text
-            sale["step"] = "price"
-            await telegram_send_text(client, chat_id, "Ora invia il prezzo in euro, ad esempio 25,50.")
-            return
-        if sale.get("step") == "price":
-            price = normalize_price(text) if re.fullmatch(r"\d+(?:[,.]\d{1,2})?", text) else None
-            if not price:
-                await telegram_send_text(client, chat_id, "Prezzo non valido. Inserisci un importo maggiore di zero, ad esempio 25,50.")
-                return
-            sale["price"] = price
-            await telegram_send_text(client, chat_id, "Carico foto e annuncio sul sito...")
+    if command in {"/annulla", "/cancel"}:
+        session = product_sessions.pop(chat_id, None)
+        if session and session.get("images"):
             try:
-                await publish_sale(client, chat_id, sale)
+                await delete_product_images(client, session["images"])
             except Exception as error:
-                logger.exception("Pubblicazione annuncio fallita (%s)", type(error).__name__)
-                await telegram_send_text(client, chat_id, "Non sono riuscito a pubblicare l'annuncio. La bozza è ancora disponibile: invia di nuovo il prezzo o usa /annulla.")
+                await telegram_send_text(
+                    client, chat_id, f"Caricamento annullato; non sono riuscito a rimuovere tutte le immagini: {error}"
+                )
                 return
-            sale_sessions.pop(chat_id, None)
-            return
+        await telegram_send_text(client, chat_id, "Caricamento annullato." if session else "Non c'è un caricamento in corso.")
+        return
+
+    session = product_sessions.get(chat_id)
+    if session and session.get("step") == "images" and (message.get("photo") or message.get("document")):
+        try:
+            storage_path = await upload_telegram_image(client, message, chat_id)
+            session["images"].append(storage_path)
+            await telegram_send_text(
+                client,
+                chat_id,
+                f"Immagine {len(session['images'])} caricata. Invia altre foto oppure premi Fine immagini.",
+                {"inline_keyboard": [[{"text": "Fine immagini", "callback_data": "upload:done"}]]},
+            )
+        except Exception as error:
+            await telegram_send_text(client, chat_id, f"Impossibile caricare l'immagine: {error}")
+        return
 
     if not text:
         return
@@ -546,25 +663,91 @@ async def process_telegram_update(
             f"Prezzo massimo attuale: {price_state['value']} €. Scegli un importo:",
             price_menu(),
         )
-    elif command == "/start":
+        return
+    if command == "/start":
         bot_state["active"] = True
+        bot_state["force_batch_limit"] = 6
         await telegram_send_text(
-            client, chat_id, "Monitor Vinted avviato! Usa /prezzo per cambiare il prezzo massimo o /stop per fermarlo."
+            client,
+            chat_id,
+            "Monitor Vinted avviato. Al prossimo controllo mostrerò al massimo 6 inserzioni. Comandi: /prezzo, /brand, /carica, /prodotti, /annulla, /stop.",
         )
-    elif command == "/stop":
+        return
+    if command == "/stop":
         bot_state["active"] = False
         await telegram_send_text(
             client, chat_id, "Monitor Vinted fermato. Usa /start per riavviarlo."
         )
-    elif command == "/brand":
-        current_brand = str(bot_state.get('brand', 'michael_kors'))
+        return
+    if command == "/brand":
+        current_brand = str(bot_state.get("brand", "michael_kors"))
         await telegram_send_text(
             client,
             chat_id,
             f"Brand attuale: {BRANDS[current_brand]['name']}. Scegli un brand:",
             brand_menu(),
         )
+        return
 
+    session = product_sessions.get(chat_id)
+    if session:
+        step = session.get("step")
+        if step == "name":
+            if text.startswith("/"):
+                await telegram_send_text(client, chat_id, "Scrivi il nome del prodotto oppure usa /annulla.")
+            else:
+                session["name"] = text[:200]
+                session["step"] = "images"
+                await telegram_send_text(
+                    client,
+                    chat_id,
+                    "Invia una o più immagini del prodotto. Quando hai finito premi Fine immagini.",
+                    {"inline_keyboard": [[{"text": "Fine immagini", "callback_data": "upload:done"}]]},
+                )
+            return
+        if step == "images":
+            if text.lower() in {"fine", "fine immagini", "fatto"}:
+                if session["images"]:
+                    session["step"] = "description"
+                    await telegram_send_text(client, chat_id, "Ora scrivi la descrizione del prodotto.")
+                else:
+                    await telegram_send_text(client, chat_id, "Invia almeno un'immagine prima di continuare.")
+            else:
+                await telegram_send_text(client, chat_id, "Invia un'immagine oppure premi Fine immagini.")
+            return
+        if step == "description":
+            if text.startswith("/"):
+                await telegram_send_text(client, chat_id, "Scrivi la descrizione oppure usa /annulla.")
+            else:
+                session["description"] = text
+                session["step"] = "price"
+                await telegram_send_text(client, chat_id, "Qual è il prezzo del prodotto in euro? (es. 25,50)")
+            return
+        if step == "price":
+            price = normalize_price(text)
+            if not price:
+                await telegram_send_text(client, chat_id, "Prezzo non valido. Inserisci un importo maggiore di zero, ad esempio 25,50.")
+                return
+            try:
+                await supabase_request(
+                    client,
+                    "POST",
+                    "/rest/v1/products",
+                    json_body={
+                        "name": session["name"],
+                        "description": session["description"],
+                        "price": price,
+                        "images": session["images"],
+                        "is_visible": True,
+                    },
+                    headers={"Prefer": "return=minimal"},
+                )
+            except Exception as error:
+                await telegram_send_text(client, chat_id, f"Non sono riuscito a salvare il prodotto: {error}. Puoi riprovare il prezzo o usare /annulla.")
+                return
+            product_sessions.pop(chat_id, None)
+            await telegram_send_text(client, chat_id, f"Prodotto «{session['name']}» caricato correttamente nella vetrina.")
+            return
 
 async def telegram_command_listener(
     client: httpx.AsyncClient, price_state: dict[str, str], bot_state: dict
@@ -688,13 +871,6 @@ async def monitor() -> None:
     price_state = load_price_state()
     bot_state = {"active": True}
     initial_batch = not seen_items
-    logger.info(
-        "Monitor startup: initial_price_max=%s initial_seen_items=%d poll_interval_config=%d initial_batch=%s",
-        price_state.get("value", "unknown"),
-        len(seen_items),
-        POLL_SECONDS,
-        initial_batch,
-    )
     pool_limits = httpx.Limits(
         max_connections=5,
         max_keepalive_connections=2,
@@ -717,27 +893,13 @@ async def monitor() -> None:
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
-                cycle_started_at = time.perf_counter()
                 cycle_price = price_state["value"]
                 cycle_batch_price = price_state.get("batch_price")
                 cycle_succeeded = False
                 try:
                     current_brand = str(bot_state.get('brand', 'michael_kors'))
-                    logger.info(
-                        "Monitor cycle start: brand=%s price_max=%s seen_items=%d initial_batch=%s batch_price=%s",
-                        current_brand,
-                        cycle_price,
-                        len(seen_items),
-                        initial_batch,
-                        cycle_batch_price or "none",
-                    )
                     item_urls = await listing_item_urls(vinted_client, cycle_price, current_brand)
                     if not item_urls:
-                        logger.warning(
-                            "Vinted catalog returned no usable item links: brand=%s price_max=%s",
-                            current_brand,
-                            cycle_price,
-                        )
                         raise RuntimeError("Nessuna inserzione trovata nel catalogo")
 
                     logger.info(
@@ -756,39 +918,20 @@ async def monitor() -> None:
                     urls_to_process, existing_item_id = select_new_item_urls(
                         item_urls, seen_items, limit
                     )
-                    logger.info(
-                        "Monitor item selection: catalog_items=%d selected_items=%d batch_limit=%s first_seen_item_id=%s",
-                        len(item_urls),
-                        len(urls_to_process),
-                        limit if limit is not None else "none",
-                        existing_item_id or "none",
-                    )
-                    catalog_item_count = len(item_urls)
-                    selected_item_count = len(urls_to_process)
 
                     for item_url in urls_to_process:
                         item_id = item_id_from_url(item_url)
                         if item_id is None:
                             continue
 
-                        item_started_at = time.perf_counter()
-                        logger.info("Monitor processing item: item_id=%s", item_id)
                         item = await read_item(vinted_client, item_url)
-                        logger.info(
-                            "Vinted item parsed: item_id=%s title=%r price=%s",
-                            item_id,
-                            item["title"][:100],
-                            item["price"],
-                        )
                         await send_telegram_item(telegram_client, item)
                         remember_item(seen_items, item_id)
                         save_seen_items(seen_items)
                         logger.info(
-                            "Telegram notification sent: item_id=%s title=%r price=%s processing_ms=%d",
-                            item_id,
+                            "Trovata e inviata su Telegram: %s (%s)",
                             item["title"],
                             item["price"],
-                            round((time.perf_counter() - item_started_at) * 1000),
                         )
                         del item  # libera subito titolo, descrizione, immagine ecc.
 
@@ -811,22 +954,9 @@ async def monitor() -> None:
                             PRICE_CHANGE_BATCH_LIMIT,
                         )
                     cycle_succeeded = True
-                    logger.info(
-                        "Monitor cycle completed: duration_ms=%d catalog_items=%d selected_items=%d",
-                        round((time.perf_counter() - cycle_started_at) * 1000),
-                        catalog_item_count,
-                        selected_item_count,
-                    )
 
                 except Exception as e:
                     logger.exception("Errore durante il controllo (%s); riprovo al prossimo ciclo", type(e).__name__)
-                    logger.error(
-                        "Monitor cycle failed: brand=%s price_max=%s duration_ms=%d exception_type=%s",
-                        bot_state.get("brand", "michael_kors"),
-                        cycle_price,
-                        round((time.perf_counter() - cycle_started_at) * 1000),
-                        type(e).__name__,
-                    )
                 finally:
                     initial_batch = False
                     if (
@@ -838,7 +968,7 @@ async def monitor() -> None:
                         save_price_state(price_state)
 
                 gc.collect()
-                wait = random.randint(5, 20)
+                wait = random.randint(30, 60)
                 logger.info(
                     "Prossimo aggiornamento del catalogo tra %d secondi", wait
                 )
