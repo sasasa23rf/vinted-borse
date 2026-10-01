@@ -35,6 +35,16 @@ Ogni nuova borsa arrivera come foto con nome, prezzo e descrizione. Il link Vint
 
 Con il monitor in esecuzione, invia al bot `/prezzo`. Comparira un menu con alcuni importi rapidi e il pulsante **Altro importo** per digitare una cifra personalizzata. Puoi anche impostare direttamente il valore con, ad esempio, `/prezzo 17,50`. Dopo un cambio effettivo del prezzo massimo, il controllo successivo elabora al massimo 10 nuove inserzioni e poi torna al normale intervallo di aggiornamento. Il valore e mantenuto in RAM fino al riavvio del processo. Il comando e accettato solo dalla chat il cui ID e configurato in `.env` o nelle variabili d'ambiente Render.
 
+## Gestire i prodotti da Telegram
+
+Per aggiungere prodotti alla vetrina, configura `SUPABASE_SERVICE_ROLE_KEY` nel `.env` locale o tra le variabili segrete del worker Render. La chiave si trova nelle impostazioni API del progetto Supabase: usa la service role key (secret), non la chiave anon/publishable, e non inserirla nei file HTML o nel repository. `SUPABASE_URL` e facoltativa per questo progetto; se necessario puoi impostarla allo URL del tuo progetto Supabase.
+
+- `/carica` avvia la procedura: nome, una o più immagini, descrizione e prezzo. Dopo ogni immagine puoi inviarne altre o premere **Fine immagini**.
+- `/annulla` interrompe la procedura e prova a rimuovere le immagini già caricate.
+- `/prodotti` mostra i prodotti a pagine. Selezionane uno e conferma per eliminarlo dal catalogo e rimuovere le immagini.
+
+Il bot accetta immagini JPG, PNG, WEBP, GIF e AVIF fino a 10 MB ciascuna. I prodotti vengono salvati nella tabella `products` e nel bucket `product-images` già creati dallo script `sito/supabase_setup.sql`.
+
 ## Avvio su Windows
 
 Apri PowerShell nella cartella del progetto ed esegui:
@@ -59,7 +69,7 @@ Per vedere il browser durante l'esecuzione, imposta `$env:VINTED_HEADLESS = "fal
 
 Il repository include `Dockerfile` e `render.yaml`. Pubblica il progetto su un repository Git e collegalo a Render con **New +** → **Blueprint**, oppure crea un servizio **Background Worker** usando Docker e il `Dockerfile` del repository. Seleziona un piano che supporti i Background Worker; il piano gratuito Render potrebbe non essere disponibile per questo tipo di servizio.
 
-Nel pannello Render aggiungi le variabili segrete `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` in **Environment**. `VINTED_POLL_SECONDS` e gia impostato a 60 nel blueprint e puo essere modificato li. Non caricare il file `.env` nel repository. Avvia una sola istanza del worker: ogni processo ha la propria RAM e istanze multiple duplicherebbero polling e notifiche Telegram.
+Nel pannello Render aggiungi le variabili segrete `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` e `SUPABASE_SERVICE_ROLE_KEY` in **Environment**. `VINTED_POLL_SECONDS` e gia impostato a 60 nel blueprint e puo essere modificato li. Non caricare il file `.env` nel repository. Avvia una sola istanza del worker: ogni processo ha la propria RAM e istanze multiple duplicherebbero polling e notifiche Telegram.
 
 Il log `No open ports detected` e normale solo per un **Background Worker**, che non deve esporre porte HTTP. Se Render imposta `WEB_CONCURRENCY` e continua a cercare porte, il servizio attuale e probabilmente un **Web Service**: crea il servizio dal Blueprint `render.yaml` oppure crea un nuovo Background Worker Docker. Non avviare il monitor come web service.
 
