@@ -60,8 +60,6 @@ MAX_SEEN_ITEMS = 500
 DEFAULT_MAX_PRICE = os.getenv("DEFAULT_MAX_PRICE", "10").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-CLOUDFLARE_API_URL = os.getenv("CLOUDFLARE_API_URL", "").strip()
-CLOUDFLARE_API_SECRET = os.getenv("CLOUDFLARE_API_SECRET", "").strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -318,104 +316,11 @@ async def process_telegram_update(
 
     message = update.get("message", {})
     chat_id = str(message.get("chat", {}).get("id", ""))
-    
-    if chat_id != TELEGRAM_CHAT_ID:
-        return
-        
     text = str(message.get("text", "")).strip()
-    photo = message.get("photo")
-
-    # --- INIZIO LOGICA /vendita ---
-    if "vendita_state" not in bot_state:
-        bot_state["vendita_state"] = {}
-        
-    v_state = bot_state["vendita_state"].get(chat_id)
-
-    if text.lower().startswith("/vendita"):
-        bot_state["vendita_state"][chat_id] = {"step": "photos", "photos": []}
-        await telegram_send_text(
-            client, chat_id, "Hai avviato la procedura di vendita.\n\nInvia ora una o più foto dell'articolo. Quando hai finito di inviare le foto, scrivi /finefoto."
-        )
-        return
-        
-    if v_state:
-        if text.lower().startswith("/annulla"):
-            bot_state["vendita_state"].pop(chat_id, None)
-            await telegram_send_text(client, chat_id, "Procedura di vendita annullata.")
-            return
-
-        if v_state["step"] == "photos":
-            if photo:
-                # Prende la foto a risoluzione maggiore (l'ultima della lista)
-                file_id = photo[-1]["file_id"]
-                v_state["photos"].append(file_id)
-                # Telegram manda le foto in messaggi separati a volte, non diamo troppi feedback
-                # await telegram_send_text(client, chat_id, f"Foto ricevuta ({len(v_state['photos'])} totali). Invia altre o scrivi /finefoto.")
-                return
-            elif text.lower().startswith("/finefoto"):
-                if not v_state["photos"]:
-                    await telegram_send_text(client, chat_id, "Non hai inviato nessuna foto! Inviale e poi scrivi /finefoto, oppure scrivi /annulla.")
-                    return
-                v_state["step"] = "desc"
-                await telegram_send_text(client, chat_id, f"Ottimo, hai inserito {len(v_state['photos'])} foto.\n\nOra scrivi la **descrizione** dell'articolo.")
-                return
-            else:
-                await telegram_send_text(client, chat_id, "Aspetto le foto. Invia un'immagine o scrivi /finefoto per procedere (oppure /annulla).")
-                return
-                
-        elif v_state["step"] == "desc":
-            if not text:
-                await telegram_send_text(client, chat_id, "Per favore, invia un testo come descrizione.")
-                return
-            v_state["description"] = text
-            v_state["step"] = "price"
-            await telegram_send_text(client, chat_id, "Descrizione salvata!\n\nInfine, scrivi il **prezzo** (es. 25,50).")
-            return
-            
-        elif v_state["step"] == "price":
-            if not text:
-                await telegram_send_text(client, chat_id, "Per favore, scrivi il prezzo in formato numerico.")
-                return
-            price = normalize_price(text)
-            if not price:
-                await telegram_send_text(client, chat_id, "Prezzo non valido. Scrivi un numero maggiore di zero (es. 15,00).")
-                return
-            
-            # Formatta prezzo
-            formatted_price = f"{Decimal(price):.2f}".replace(".", ",") + " €"
-            
-            # Invia a Cloudflare
-            if not CLOUDFLARE_API_URL or not CLOUDFLARE_API_SECRET:
-                await telegram_send_text(client, chat_id, "Errore: CLOUDFLARE_API_URL o CLOUDFLARE_API_SECRET non configurati nel file .env.")
-            else:
-                try:
-                    payload = {
-                        "photos": v_state["photos"],
-                        "description": v_state["description"],
-                        "price": formatted_price
-                    }
-                    resp = await client.post(
-                        CLOUDFLARE_API_URL,
-                        json=payload,
-                        headers={"Authorization": f"Bearer {CLOUDFLARE_API_SECRET}"},
-                        timeout=15
-                    )
-                    resp.raise_for_status()
-                    await telegram_send_text(client, chat_id, f"✅ Articolo pubblicato con successo sul tuo sito!\nPrezzo: {formatted_price}")
-                except Exception as e:
-                    logger.error(f"Errore Cloudflare API: {e}")
-                    await telegram_send_text(client, chat_id, f"❌ Errore durante la pubblicazione sul sito: {e}")
-            
-            # Reset stato
-            bot_state["vendita_state"].pop(chat_id, None)
-            return
-    # --- FINE LOGICA /vendita ---
-
-    if not text:
+    if chat_id != TELEGRAM_CHAT_ID or not text:
         return
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-
     if chat_id in awaiting_custom_price and not text.startswith("/"):
         price = normalize_price(text)
         if price:
