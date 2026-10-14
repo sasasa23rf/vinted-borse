@@ -51,10 +51,25 @@ BRANDS = {
     }
 }
 VINTED_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
-    "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Ch-Ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
 }
 POLL_SECONDS = max(5, int(os.getenv("VINTED_POLL_SECONDS", "15")))
+VINTED_BASE_URL = "https://www.vinted.it"
+# Rinnova la sessione ogni 25-35 minuti (simula apertura nuova scheda)
+SESSION_REFRESH_INTERVAL = random.randint(25 * 60, 35 * 60)
 INITIAL_BATCH_LIMIT = 5
 PRICE_CHANGE_BATCH_LIMIT = 10
 MAX_SEEN_ITEMS = 500
@@ -161,6 +176,30 @@ class CatalogLinkParser(HTMLParser):
         href = dict(attrs).get("href")
         if href and "/items/" in href:
             self.urls.append(urljoin("https://www.vinted.it", html.unescape(href)))
+
+
+async def warm_up_session(client: httpx.AsyncClient) -> None:
+    """Visita la homepage di Vinted per ottenere cookie di sessione realistici,
+    esattamente come farebbe un browser umano prima di navigare nel catalogo."""
+    try:
+        # 1) Visita la homepage
+        resp = await client.get(VINTED_BASE_URL, timeout=30)
+        await resp.aclose()
+        logger.info("Sessione Vinted inizializzata (homepage visitata, cookie acquisiti)")
+
+        # 2) Pausa umana: l'utente "guarda" la homepage per 2-5 secondi
+        await asyncio.sleep(random.uniform(2.0, 5.0))
+
+        # 3) Visita la pagina catalogo generale (come farebbe un utente che naviga)
+        general_catalog = f"{VINTED_BASE_URL}/catalog?order=newest_first"
+        resp2 = await client.get(general_catalog, timeout=30)
+        await resp2.aclose()
+        logger.info("Sessione Vinted riscaldata (catalogo generale visitato)")
+
+        # 4) Piccola pausa prima di iniziare lo scraping
+        await asyncio.sleep(random.uniform(1.5, 3.5))
+    except Exception as e:
+        logger.warning("Warm-up sessione Vinted non riuscito (%s); continuo comunque", e)
 
 
 async def listing_item_urls(client: httpx.AsyncClient, max_price: str, brand_key: str = "michael_kors") -> list[str]:
@@ -875,6 +914,9 @@ async def monitor() -> None:
         max_connections=5,
         max_keepalive_connections=2,
     )
+    # Traccia quando rinnovare la sessione
+    last_session_warmup: float = 0.0
+    session_refresh_interval: float = float(SESSION_REFRESH_INTERVAL)
     async with (
         httpx.AsyncClient(
             timeout=30,
@@ -892,6 +934,14 @@ async def monitor() -> None:
                 if not bot_state["active"]:
                     await asyncio.sleep(POLL_SECONDS)
                     continue
+
+                # Rinnova la sessione all'avvio e ogni SESSION_REFRESH_INTERVAL secondi
+                now = time.time()
+                if now - last_session_warmup >= session_refresh_interval:
+                    await warm_up_session(vinted_client)
+                    last_session_warmup = time.time()
+                    # Pianifica il prossimo rinnovo con un intervallo leggermente diverso
+                    session_refresh_interval = float(random.randint(25 * 60, 35 * 60))
 
                 cycle_price = price_state["value"]
                 cycle_batch_price = price_state.get("batch_price")
@@ -923,6 +973,12 @@ async def monitor() -> None:
                         item_id = item_id_from_url(item_url)
                         if item_id is None:
                             continue
+
+                        # Pausa umana PRIMA di aprire l'inserzione
+                        # (simula l'utente che scorre il catalogo e clicca dopo qualche secondo)
+                        human_delay = random.uniform(2.5, 7.0)
+                        logger.info("Pausa umana di %.1f s prima di aprire l'inserzione", human_delay)
+                        await asyncio.sleep(human_delay)
 
                         item = await read_item(vinted_client, item_url)
                         await send_telegram_item(telegram_client, item)
