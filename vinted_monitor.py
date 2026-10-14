@@ -48,6 +48,10 @@ BRANDS = {
     "trussardi": {
         "name": "Trussardi",
         "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=8729&page=1&order=newest_first&price_to={price}&currency=EUR"
+    },
+    "marchi_costosi": {
+        "name": "Marchi Costosi",
+        "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=567&brand_ids[]=15450529&brand_ids[]=1189&brand_ids[]=417&brand_ids[]=3573&brand_ids[]=377&page=1&order=newest_first&price_to={price}&currency=EUR"
     }
 }
 VINTED_HEADERS = {
@@ -709,7 +713,7 @@ async def process_telegram_update(
         await telegram_send_text(
             client,
             chat_id,
-            "Monitor Vinted avviato. Al prossimo controllo mostrerò al massimo 6 inserzioni. Comandi: /prezzo, /brand, /carica, /prodotti, /annulla, /stop.",
+            "Monitor Vinted avviato. Al prossimo controllo mostrerò al massimo 6 inserzioni. Comandi: /prezzo, /brand (incl. Marchi Costosi), /carica, /prodotti, /annulla, /stop.",
         )
         return
     if command == "/stop":
