@@ -54,8 +54,8 @@ BRANDS = {
         "url": "https://www.vinted.it/catalog?catalog[]=19&brand_ids[]=567&brand_ids[]=15450529&brand_ids[]=1189&brand_ids[]=417&brand_ids[]=3573&brand_ids[]=377&page=1&order=newest_first&price_to={price}&currency=EUR"
     },
     "harmont_blaine": {
-        "name": "Harmont & Blaine",
-        "url": "https://www.vinted.it/catalog?catalog[]=2050&brand_ids[]=200412&page=1&order=newest_first&price_to={price}&currency=EUR"
+        "name": "Harmont&Blaine-taglia S",
+        "url": "https://www.vinted.it/catalog?search_id=4825909513&catalog[]=2050&brand_ids[]=200412&page=1&time=0&order=newest_first&price_to={price}&currency=EUR&size_ids[]=207&size_ids[]=1662"
     }
 }
 VINTED_HEADERS = {
