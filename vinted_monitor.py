@@ -230,6 +230,34 @@ async def listing_item_urls(client: httpx.AsyncClient, max_price: str, brand_key
     return unique_urls
 
 
+async def listing_item_urls_from_custom_url(client: httpx.AsyncClient, custom_url: str) -> list[str]:
+    """Scarica le inserzioni direttamente dall'URL personalizzato, senza modificare prezzo o altri parametri."""
+    # Aggiunge solo il parametro time per evitare cache
+    parts = urlsplit(custom_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["time"] = str(int(time.time()))
+    url_with_time = urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query, safe="[]"), "")
+    )
+    response = await client.get(url_with_time, timeout=30)
+    try:
+        response.raise_for_status()
+        page_text = response.text
+    finally:
+        await response.aclose()
+    parser = CatalogLinkParser()
+    parser.feed(page_text)
+    del page_text
+    unique_urls: list[str] = []
+    found_ids: set[str] = set()
+    for url in parser.urls:
+        item_id = item_id_from_url(url)
+        if item_id and item_id not in found_ids:
+            found_ids.add(item_id)
+            unique_urls.append(url)
+    return unique_urls
+
+
 def select_new_item_urls(
     item_urls: list[str],
     seen_items: Collection[str],
@@ -541,6 +569,7 @@ def brand_menu() -> dict:
         for key, brand in BRANDS.items()
     ]
     rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([{"text": "🔗 Link personalizzato", "callback_data": "brand:custom_url"}])
     return {"inline_keyboard": rows}
 
 
@@ -549,6 +578,7 @@ async def process_telegram_update(
     update: dict,
     price_state: dict[str, str],
     awaiting_custom_price: set[str],
+    awaiting_custom_url: set[str],
     bot_state: dict,
 ) -> None:
     callback = update.get("callback_query")
@@ -604,13 +634,21 @@ async def process_telegram_update(
                 await telegram_send_text(
                     client, chat_id, f"Prezzo massimo impostato a {price} €."
                 )
+        elif callback_data == "brand:custom_url":
+            awaiting_custom_url.add(chat_id)
+            await telegram_send_text(
+                client,
+                chat_id,
+                "Invia il link personalizzato Vinted. Il bot lo userà così com'è, ignorando prezzo e brand impostati.",
+            )
         elif callback_data.startswith("brand:"):
             brand_key = callback_data.removeprefix("brand:")
             if brand_key in BRANDS:
                 bot_state["brand"] = brand_key
+                bot_state.pop("custom_url", None)  # rimuove eventuale URL personalizzato
                 bot_state["force_batch_limit"] = 6
                 await telegram_send_text(
-                    client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}."
+                    client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}. Prezzo massimo ripristinato a {DEFAULT_MAX_PRICE} €."
                 )
         return
 
@@ -674,6 +712,25 @@ async def process_telegram_update(
     if not text:
         return
 
+    if chat_id in awaiting_custom_url and not text.startswith("/"):
+        # Verifica che sia un URL Vinted plausibile
+        if text.startswith("http") and "vinted" in text:
+            bot_state["custom_url"] = text
+            bot_state["force_batch_limit"] = 6
+            awaiting_custom_url.discard(chat_id)
+            await telegram_send_text(
+                client,
+                chat_id,
+                f"✅ Link personalizzato impostato. Il bot userà questo URL ignorando prezzo e brand.\n{text}",
+            )
+        else:
+            await telegram_send_text(
+                client,
+                chat_id,
+                "Link non valido. Invia un URL Vinted valido (deve iniziare con https://www.vinted...).",
+            )
+        return
+
     if chat_id in awaiting_custom_price and not text.startswith("/"):
         price = normalize_price(text)
         if price:
@@ -728,10 +785,15 @@ async def process_telegram_update(
         return
     if command == "/brand":
         current_brand = str(bot_state.get("brand", "michael_kors"))
+        custom_url = bot_state.get("custom_url")
+        if custom_url:
+            status_text = f"Modalità attuale: Link personalizzato\n{custom_url}\n\nScegli un brand (o imposta un nuovo link):"
+        else:
+            status_text = f"Brand attuale: {BRANDS[current_brand]['name']}. Scegli un brand:"
         await telegram_send_text(
             client,
             chat_id,
-            f"Brand attuale: {BRANDS[current_brand]['name']}. Scegli un brand:",
+            status_text,
             brand_menu(),
         )
         return
@@ -801,6 +863,7 @@ async def telegram_command_listener(
 ) -> None:
     offset: int | None = None
     awaiting_custom_price: set[str] = set()
+    awaiting_custom_url: set[str] = set()
     while True:
         try:
             params: dict[str, str | int] = {"timeout": 20}
@@ -818,7 +881,7 @@ async def telegram_command_listener(
             for update in result.get("result", []):
                 offset = int(update["update_id"]) + 1
                 await process_telegram_update(
-                    client, update, price_state, awaiting_custom_price, bot_state
+                    client, update, price_state, awaiting_custom_price, awaiting_custom_url, bot_state
                 )
         except asyncio.CancelledError:
             raise
@@ -955,8 +1018,12 @@ async def monitor() -> None:
                 cycle_batch_price = price_state.get("batch_price")
                 cycle_succeeded = False
                 try:
-                    current_brand = str(bot_state.get('brand', 'michael_kors'))
-                    item_urls = await listing_item_urls(vinted_client, cycle_price, current_brand)
+                    custom_url = bot_state.get("custom_url")
+                    if custom_url:
+                        item_urls = await listing_item_urls_from_custom_url(vinted_client, custom_url)
+                    else:
+                        current_brand = str(bot_state.get('brand', 'michael_kors'))
+                        item_urls = await listing_item_urls(vinted_client, cycle_price, current_brand)
                     if not item_urls:
                         raise RuntimeError("Nessuna inserzione trovata nel catalogo")
 
