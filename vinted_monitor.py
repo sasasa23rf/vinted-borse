@@ -15,7 +15,6 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlu
 
 import httpx
 from dotenv import load_dotenv
-from playwright.async_api import Page, async_playwright
 import threading
 import time
 import uuid
@@ -77,11 +76,6 @@ VINTED_HEADERS = {
 }
 POLL_SECONDS = max(5, int(os.getenv("VINTED_POLL_SECONDS", "15")))
 VINTED_BASE_URL = "https://www.vinted.it"
-VINTED_HEADLESS = os.getenv("VINTED_HEADLESS", "true").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
 # Rinnova la sessione ogni 25-35 minuti (simula apertura nuova scheda)
 SESSION_REFRESH_INTERVAL = random.randint(25 * 60, 35 * 60)
 INITIAL_BATCH_LIMIT = 5
@@ -97,8 +91,6 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_IMAGE_BUCKET = "product-images"
 MAX_PRODUCT_IMAGE_SIZE = 10 * 1024 * 1024
 PRODUCTS_PAGE_SIZE = 8
-BRAND_SCAN_BATCH_SIZE = 10
-BRAND_SCAN_MAX_SCROLLS = 80
 ALLOWED_PRODUCT_IMAGE_TYPES = {
     "image/jpeg": "jpg",
     "image/png": "png",
@@ -239,15 +231,11 @@ async def listing_item_urls(client: httpx.AsyncClient, max_price: str, brand_key
 
 
 async def listing_item_urls_from_custom_url(client: httpx.AsyncClient, custom_url: str) -> list[str]:
-    """Scarica gli articoli direttamente dal link di ricerca senza alterarne i filtri."""
+    """Scarica le inserzioni direttamente dall'URL personalizzato, senza modificare prezzo o altri parametri."""
     # Aggiunge solo il parametro time per evitare cache
     parts = urlsplit(custom_url)
-    query = [
-        (key, value)
-        for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if key != "time"
-    ]
-    query.append(("time", str(int(time.time()))))
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["time"] = str(int(time.time()))
     url_with_time = urlunsplit(
         (parts.scheme, parts.netloc, parts.path, urlencode(query, safe="[]"), "")
     )
@@ -268,213 +256,6 @@ async def listing_item_urls_from_custom_url(client: httpx.AsyncClient, custom_ur
             found_ids.add(item_id)
             unique_urls.append(url)
     return unique_urls
-
-
-async def inspect_user_listing_prices(page: Page, item_url: str) -> dict[str, int]:
-    response = await page.goto(item_url, wait_until="domcontentloaded", timeout=60_000)
-    if response and response.status >= 400:
-        raise RuntimeError(f"La pagina dell'articolo ha risposto con HTTP {response.status}")
-    await page.wait_for_timeout(2_500)
-
-    section_script = """
-        () => {
-            const normalize = value => value.toLocaleLowerCase("it-IT")
-                .replace(/[’']/g, "'").replace(/\\s+/g, " ").trim();
-            const headings = Array.from(document.querySelectorAll(
-                "h1, h2, h3, h4, h5, h6, [role='heading']"
-            ));
-            const userLabels = [
-                "articoli dell'utente", "articoli del membro",
-                "articoli del venditore", "items for sale"
-            ];
-            const similarLabels = [
-                "articoli simili", "articoli correlati",
-                "annunci simili", "similar items", "similar articles"
-            ];
-            const findHeading = labels => headings.find(element => {
-                const text = normalize(element.innerText || "");
-                return labels.some(label => text === label || text.startsWith(label + " "));
-            });
-            const userHeading = findHeading(userLabels);
-            const similarHeading = findHeading(similarLabels);
-            if (!userHeading || !similarHeading) {
-                return {ready: false, reason: "heading"};
-            }
-
-            const userRect = userHeading.getBoundingClientRect();
-            const similarRect = similarHeading.getBoundingClientRect();
-            const startY = userRect.bottom + window.scrollY;
-            const endY = similarRect.top + window.scrollY;
-            const similarVisible = similarRect.top <= window.innerHeight + 200
-                && similarRect.bottom >= -100;
-            if (endY <= startY || !similarVisible) {
-                return {ready: false, reason: "scroll"};
-            }
-
-            const pricePattern = /\\d[\\d.,]*\\s*(?:€|EUR)/i;
-            const cards = new Map();
-            for (const anchor of document.querySelectorAll("a[href*='/items/']")) {
-                const match = new URL(anchor.href).pathname.match(/\\/items\\/(\\d+)/);
-                if (!match || cards.has(match[1])) continue;
-                const rect = anchor.getBoundingClientRect();
-                const itemY = rect.top + window.scrollY;
-                if (itemY <= startY || itemY >= endY) continue;
-
-                let text = anchor.innerText || "";
-                let parent = anchor.parentElement;
-                for (let depth = 0; depth < 5 && parent; depth++, parent = parent.parentElement) {
-                    const parentText = parent.innerText || "";
-                    if (parentText.length > 700) break;
-                    const parentItemIds = new Set(
-                        Array.from(parent.querySelectorAll("a[href*='/items/']"))
-                            .map(link => new URL(link.href).pathname.match(/\\/items\\/(\\d+)/)?.[1])
-                            .filter(Boolean)
-                    );
-                    if (parentItemIds.size > 1) continue;
-                    if (pricePattern.test(parentText)) {
-                        text = parentText;
-                        break;
-                    }
-                }
-                cards.set(match[1], {id: match[1], url: anchor.href, text});
-            }
-            return {ready: true, cards: Array.from(cards.values())};
-        }
-    """
-
-    section: dict = {}
-    for _ in range(BRAND_SCAN_MAX_SCROLLS):
-        section = await page.evaluate(section_script)
-        if section.get("ready"):
-            break
-        await page.evaluate(
-            "window.scrollBy(0, Math.max(400, Math.floor(window.innerHeight * 0.8)))"
-        )
-        await page.wait_for_timeout(400)
-    else:
-        raise RuntimeError(
-            "Non trovo la sezione 'Articoli dell'utente' seguita da 'Articoli simili'; "
-            "controlla la pagina o riprova più tardi."
-        )
-
-    counts = {"1.00": 0, "1.50": 0, "2.00": 0}
-    targets = {Decimal("1.00"), Decimal("1.50"), Decimal("2.00")}
-    price_pattern = re.compile(r"(?<![\d.,])(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)", re.I)
-    for card in section.get("cards", []):
-        prices = price_pattern.findall(str(card.get("text", "")))
-        if not prices:
-            continue
-        try:
-            price = Decimal(prices[-1].replace(",", "."))
-        except InvalidOperation:
-            continue
-        if price in targets:
-            counts[f"{price:.2f}"] += 1
-    return counts
-
-
-BRAND_SCAN_STATE_FILE = ROOT_DIR / "brand_scan_state.json"
-
-
-def load_brand_scan_state() -> dict[str, dict]:
-    if not BRAND_SCAN_STATE_FILE.exists():
-        return {}
-    try:
-        data = json.loads(BRAND_SCAN_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Archivio scansione brand illeggibile: {error}") from error
-    if not isinstance(data, dict):
-        raise RuntimeError("Archivio scansione brand non valido: formato inatteso")
-    for item_id, item in data.items():
-        if (
-            not str(item_id).isdigit()
-            or not isinstance(item, dict)
-            or not isinstance(item.get("status"), str)
-            or item["status"] not in {"pending", "ready", "done"}
-        ):
-            raise RuntimeError("Archivio scansione brand non valido: elemento inatteso")
-    return data
-
-
-def save_brand_scan_state(state: dict[str, dict]) -> None:
-    temporary_path = BRAND_SCAN_STATE_FILE.with_suffix(".json.tmp")
-    try:
-        temporary_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.replace(temporary_path, BRAND_SCAN_STATE_FILE)
-    except OSError as error:
-        raise RuntimeError(f"Salvataggio archivio scansione brand non riuscito: {error}") from error
-
-
-async def send_brand_scan_result(
-    client: httpx.AsyncClient, item_url: str, counts: dict[str, int]
-) -> None:
-    await telegram_send_text(
-        client,
-        TELEGRAM_CHAT_ID,
-        (
-            "Scansione articoli dell'utente completata\n"
-            f"1,00 €: {counts['1.00']}\n"
-            f"1,50 €: {counts['1.50']}\n"
-            f"2,00 €: {counts['2.00']}\n"
-            f"Link: {item_url}"
-        ),
-    )
-
-
-async def scan_brand_search_url(
-    vinted_client: httpx.AsyncClient,
-    telegram_client: httpx.AsyncClient,
-    search_url: str,
-    scan_state: dict[str, dict],
-    bot_state: dict,
-) -> None:
-    item_urls = await listing_item_urls_from_custom_url(vinted_client, search_url)
-    pending_urls: list[tuple[str, str]] = []
-    for item_url in item_urls[:BRAND_SCAN_BATCH_SIZE]:
-        item_id = item_id_from_url(item_url)
-        if item_id and item_id not in scan_state:
-            scan_state[item_id] = {"url": item_url, "status": "pending"}
-            pending_urls.append((item_id, item_url))
-    if pending_urls:
-        save_brand_scan_state(scan_state)
-
-    for item in scan_state.values():
-        if item.get("status") == "ready":
-            await send_brand_scan_result(
-                telegram_client, str(item["url"]), item["counts"]
-            )
-            item["status"] = "done"
-            save_brand_scan_state(scan_state)
-
-    if not any(item.get("status") == "pending" for item in scan_state.values()):
-        if not item_urls:
-            raise RuntimeError("Nessuna inserzione trovata nel link di ricerca Vinted")
-        logger.info("Nessuna nuova inserzione da analizzare nel link di ricerca")
-        return
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=VINTED_HEADLESS)
-        try:
-            context = await browser.new_context(locale="it-IT")
-            page = await context.new_page()
-            for item_id, item in scan_state.items():
-                if item.get("status") != "pending":
-                    continue
-                if not bot_state.get("active") or bot_state.get("brand_scan_url") != search_url:
-                    break
-                item_url = str(item.get("url", ""))
-                counts = await inspect_user_listing_prices(page, item_url)
-                item["counts"] = counts
-                item["status"] = "ready"
-                save_brand_scan_state(scan_state)
-                await send_brand_scan_result(telegram_client, item_url, counts)
-                item["status"] = "done"
-                save_brand_scan_state(scan_state)
-                logger.info("Analizzati gli articoli dell'utente per ID %s", item_id)
-        finally:
-            await browser.close()
 
 
 def select_new_item_urls(
@@ -782,17 +563,6 @@ def price_menu() -> dict:
     rows.append([{"text": "Altro importo", "callback_data": "max:custom"}])
     return {"inline_keyboard": rows}
 
-
-def is_vinted_search_url(value: str) -> bool:
-    parsed = urlsplit(value)
-    hostname = (parsed.hostname or "").lower()
-    return (
-        parsed.scheme == "https"
-        and (hostname == "vinted.it" or hostname.endswith(".vinted.it"))
-        and parsed.path.rstrip("/") == "/catalog"
-    )
-
-
 def brand_menu() -> dict:
     buttons = [
         {"text": brand["name"], "callback_data": f"brand:{key}"}
@@ -800,7 +570,6 @@ def brand_menu() -> dict:
     ]
     rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
     rows.append([{"text": "🔗 Link personalizzato", "callback_data": "brand:custom_url"}])
-    rows.append([{"text": "LINK ricerca", "callback_data": "brand:search_link"}])
     return {"inline_keyboard": rows}
 
 
@@ -810,7 +579,6 @@ async def process_telegram_update(
     price_state: dict[str, str],
     awaiting_custom_price: set[str],
     awaiting_custom_url: set[str],
-    awaiting_search_link: set[str],
     bot_state: dict,
 ) -> None:
     callback = update.get("callback_query")
@@ -866,16 +634,7 @@ async def process_telegram_update(
                 await telegram_send_text(
                     client, chat_id, f"Prezzo massimo impostato a {price} €."
                 )
-        elif callback_data == "brand:search_link":
-            awaiting_custom_url.discard(chat_id)
-            awaiting_search_link.add(chat_id)
-            await telegram_send_text(
-                client,
-                chat_id,
-                "Incolla il link della ricerca Vinted (pagina /catalog). Analizzerò al massimo 10 inserzioni nuove senza inviare gli annunci.",
-            )
         elif callback_data == "brand:custom_url":
-            awaiting_search_link.discard(chat_id)
             awaiting_custom_url.add(chat_id)
             await telegram_send_text(
                 client,
@@ -885,12 +644,8 @@ async def process_telegram_update(
         elif callback_data.startswith("brand:"):
             brand_key = callback_data.removeprefix("brand:")
             if brand_key in BRANDS:
-                awaiting_custom_url.discard(chat_id)
-                awaiting_search_link.discard(chat_id)
                 bot_state["brand"] = brand_key
-                bot_state.pop("brand_scan_url", None)
-                bot_state.pop("custom_url", None)
-                bot_state.pop("brand_scan_last_error", None)
+                bot_state.pop("custom_url", None)  # rimuove eventuale URL personalizzato
                 bot_state["force_batch_limit"] = 6
                 await telegram_send_text(
                     client, chat_id, f"Brand impostato su {BRANDS[brand_key]['name']}. Prezzo massimo ripristinato a {DEFAULT_MAX_PRICE} €."
@@ -957,28 +712,10 @@ async def process_telegram_update(
     if not text:
         return
 
-    if chat_id in awaiting_search_link and not text.startswith("/"):
-        if is_vinted_search_url(text):
-            bot_state["brand_scan_url"] = text
-            bot_state.pop("brand_scan_last_error", None)
-            awaiting_search_link.discard(chat_id)
-            await telegram_send_text(
-                client,
-                chat_id,
-                f"Link di ricerca impostato. Al prossimo controllo analizzerò fino a 10 inserzioni nuove senza inviarle come annunci.\n{text}",
-            )
-        else:
-            await telegram_send_text(
-                client,
-                chat_id,
-                "Link non valido. Invia l'URL HTTPS di una ricerca Vinted, ad esempio https://www.vinted.it/catalog?...",
-            )
-        return
-
     if chat_id in awaiting_custom_url and not text.startswith("/"):
+        # Verifica che sia un URL Vinted plausibile
         if text.startswith("http") and "vinted" in text:
             bot_state["custom_url"] = text
-            bot_state.pop("brand_scan_url", None)
             bot_state["force_batch_limit"] = 6
             awaiting_custom_url.discard(chat_id)
             await telegram_send_text(
@@ -1048,11 +785,9 @@ async def process_telegram_update(
         return
     if command == "/brand":
         current_brand = str(bot_state.get("brand", "michael_kors"))
-        brand_scan_url = bot_state.get("brand_scan_url")
-        if brand_scan_url:
-            status_text = f"Modalità attuale: LINK ricerca\n{brand_scan_url}\n\nScegli un brand o imposta un altro link:"
-        elif bot_state.get("custom_url"):
-            status_text = f"Modalità attuale: Link personalizzato\n{bot_state['custom_url']}\n\nScegli un brand o imposta un nuovo link:"
+        custom_url = bot_state.get("custom_url")
+        if custom_url:
+            status_text = f"Modalità attuale: Link personalizzato\n{custom_url}\n\nScegli un brand (o imposta un nuovo link):"
         else:
             status_text = f"Brand attuale: {BRANDS[current_brand]['name']}. Scegli un brand:"
         await telegram_send_text(
@@ -1129,7 +864,6 @@ async def telegram_command_listener(
     offset: int | None = None
     awaiting_custom_price: set[str] = set()
     awaiting_custom_url: set[str] = set()
-    awaiting_search_link: set[str] = set()
     while True:
         try:
             params: dict[str, str | int] = {"timeout": 20}
@@ -1147,13 +881,7 @@ async def telegram_command_listener(
             for update in result.get("result", []):
                 offset = int(update["update_id"]) + 1
                 await process_telegram_update(
-                    client,
-                    update,
-                    price_state,
-                    awaiting_custom_price,
-                    awaiting_custom_url,
-                    awaiting_search_link,
-                    bot_state,
+                    client, update, price_state, awaiting_custom_price, awaiting_custom_url, bot_state
                 )
         except asyncio.CancelledError:
             raise
@@ -1250,7 +978,6 @@ async def monitor() -> None:
         )
 
     seen_items: OrderedDict[str, None] = load_seen_items()
-    brand_scan_state = load_brand_scan_state()
     price_state = load_price_state()
     bot_state = {"active": True}
     initial_batch = not seen_items
@@ -1284,45 +1011,8 @@ async def monitor() -> None:
                 if now - last_session_warmup >= session_refresh_interval:
                     await warm_up_session(vinted_client)
                     last_session_warmup = time.time()
+                    # Pianifica il prossimo rinnovo con un intervallo leggermente diverso
                     session_refresh_interval = float(random.randint(25 * 60, 35 * 60))
-
-                brand_scan_url = bot_state.get("brand_scan_url")
-                if brand_scan_url:
-                    try:
-                        await scan_brand_search_url(
-                            vinted_client,
-                            telegram_client,
-                            str(brand_scan_url),
-                            brand_scan_state,
-                            bot_state,
-                        )
-                        bot_state.pop("brand_scan_last_error", None)
-                    except Exception as error:
-                        logger.exception(
-                            "Scansione LINK ricerca non riuscita (%s)",
-                            type(error).__name__,
-                        )
-                        error_message = f"{type(error).__name__}: {error}"
-                        if bot_state.get("brand_scan_last_error") != error_message:
-                            try:
-                                await telegram_send_text(
-                                    telegram_client,
-                                    TELEGRAM_CHAT_ID,
-                                    f"Scansione LINK ricerca non riuscita: {error}",
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "Non sono riuscito a notificare l'errore della scansione"
-                                )
-                            bot_state["brand_scan_last_error"] = error_message
-                    gc.collect()
-                    wait = random.randint(30, 60)
-                    logger.info(
-                        "Prossimo aggiornamento del LINK ricerca tra %d secondi",
-                        wait,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
 
                 cycle_price = price_state["value"]
                 cycle_batch_price = price_state.get("batch_price")
@@ -1330,14 +1020,10 @@ async def monitor() -> None:
                 try:
                     custom_url = bot_state.get("custom_url")
                     if custom_url:
-                        item_urls = await listing_item_urls_from_custom_url(
-                            vinted_client, str(custom_url)
-                        )
+                        item_urls = await listing_item_urls_from_custom_url(vinted_client, custom_url)
                     else:
-                        current_brand = str(bot_state.get("brand", "michael_kors"))
-                        item_urls = await listing_item_urls(
-                            vinted_client, cycle_price, current_brand
-                        )
+                        current_brand = str(bot_state.get('brand', 'michael_kors'))
+                        item_urls = await listing_item_urls(vinted_client, cycle_price, current_brand)
                     if not item_urls:
                         raise RuntimeError("Nessuna inserzione trovata nel catalogo")
 
